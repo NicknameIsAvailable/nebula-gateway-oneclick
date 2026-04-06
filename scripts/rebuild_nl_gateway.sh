@@ -19,6 +19,13 @@ set -euo pipefail
 #   SKIP_PREFLIGHT_BACKUP=1
 #   RESTIC_REPOSITORY=... RESTIC_PASSWORD=...
 #   BORG_REPO=... BORG_PASSPHRASE=...
+#
+# Optional Happ-compatible feed layer:
+#   HAPP_COMPAT_MODE=1
+#   HAPP_SUBSCRIPTION_PORT=18080
+#   HAPP_SUBSCRIPTION_PATH=/sub/your-token
+#   HAPP_PUBLIC_HOST=vpn.example.com
+#   HAPP_PUSH_URL=... HAPP_PUSH_AUTH_HEADER=...
 
 TOTAL_STEPS=11
 CURRENT_STEP=0
@@ -44,6 +51,12 @@ log_info() { echo "${C_BLUE}[info]${C_RESET} $*"; }
 log_ok() { echo "${C_GREEN}[ok]${C_RESET} $*"; }
 log_warn() { echo "${C_YELLOW}[warn]${C_RESET} $*"; }
 log_err() { echo "${C_RED}[error]${C_RESET} $*"; }
+is_enabled() {
+  case "${1,,}" in
+    1 | true | yes | y | on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 trap 'log_err "Failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
 
@@ -69,7 +82,22 @@ HY2_PASSWORD="${HY2_PASSWORD:-$(openssl rand -base64 24 | tr -d '=+/' | cut -c1-
 MTPROXY_TLS_DOMAIN="${MTPROXY_TLS_DOMAIN:-www.cloudflare.com}"
 MTPROXY_SECRET="${MTPROXY_SECRET:-$(openssl rand -hex 16)}"
 
+HAPP_COMPAT_MODE="${HAPP_COMPAT_MODE:-0}"
+HAPP_PROFILE_NAME="${HAPP_PROFILE_NAME:-nebula-gateway}"
+HAPP_SUBSCRIPTION_TOKEN="${HAPP_SUBSCRIPTION_TOKEN:-$(openssl rand -hex 12)}"
+HAPP_SUBSCRIPTION_PORT="${HAPP_SUBSCRIPTION_PORT:-18080}"
+HAPP_SUBSCRIPTION_PATH="${HAPP_SUBSCRIPTION_PATH:-/sub/${HAPP_SUBSCRIPTION_TOKEN}}"
+HAPP_PUBLIC_HOST="${HAPP_PUBLIC_HOST:-}"
+HAPP_PUSH_URL="${HAPP_PUSH_URL:-}"
+HAPP_PUSH_AUTH_HEADER="${HAPP_PUSH_AUTH_HEADER:-}"
+
 SKIP_PREFLIGHT_BACKUP="${SKIP_PREFLIGHT_BACKUP:-0}"
+
+HAPP_COMPAT_ENABLED=0
+if is_enabled "${HAPP_COMPAT_MODE}"; then
+  HAPP_COMPAT_ENABLED=1
+  TOTAL_STEPS=$((TOTAL_STEPS + 1))
+fi
 
 OS_PRETTY="unknown"
 OS_ID="unknown"
@@ -117,22 +145,22 @@ install_base_packages() {
     apt)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y
-      apt-get install -y curl wget jq openssl git ca-certificates make gcc g++ zlib1g-dev libssl-dev
+      apt-get install -y curl wget jq openssl git ca-certificates make gcc g++ zlib1g-dev libssl-dev python3
       ;;
     dnf)
       dnf makecache -y
-      dnf install -y curl wget jq openssl git ca-certificates make gcc gcc-c++ zlib-devel openssl-devel
+      dnf install -y curl wget jq openssl git ca-certificates make gcc gcc-c++ zlib-devel openssl-devel python3
       ;;
     yum)
       yum makecache -y
-      yum install -y curl wget jq openssl git ca-certificates make gcc gcc-c++ zlib-devel openssl-devel
+      yum install -y curl wget jq openssl git ca-certificates make gcc gcc-c++ zlib-devel openssl-devel python3
       ;;
     pacman)
-      pacman -Sy --noconfirm --needed curl wget jq openssl git ca-certificates base-devel zlib
+      pacman -Sy --noconfirm --needed curl wget jq openssl git ca-certificates base-devel zlib python
       ;;
     zypper)
       zypper --non-interactive refresh
-      zypper --non-interactive install curl wget jq openssl git ca-certificates make gcc gcc-c++ zlib-devel libopenssl-devel
+      zypper --non-interactive install curl wget jq openssl git ca-certificates make gcc gcc-c++ zlib-devel libopenssl-devel python3
       ;;
     *)
       log_err "Unsupported package manager: ${PKG_MGR}"
@@ -209,10 +237,145 @@ extract_reality_public_key() {
   echo "$1" | awk -F': ' '/Public key|PublicKey|Password \(PublicKey\)/ {print $2; exit}'
 }
 
+normalize_happ_settings() {
+  if [[ "${HAPP_SUBSCRIPTION_PATH}" != /* ]]; then
+    HAPP_SUBSCRIPTION_PATH="/${HAPP_SUBSCRIPTION_PATH}"
+  fi
+  if [[ "${HAPP_SUBSCRIPTION_PATH}" == */ ]]; then
+    HAPP_SUBSCRIPTION_PATH="${HAPP_SUBSCRIPTION_PATH%/}"
+  fi
+  if [[ "${HAPP_SUBSCRIPTION_PATH}" == *".."* ]]; then
+    log_err "HAPP_SUBSCRIPTION_PATH cannot contain '..'"
+    exit 1
+  fi
+  if ! [[ "${HAPP_SUBSCRIPTION_PORT}" =~ ^[0-9]+$ ]] || ((HAPP_SUBSCRIPTION_PORT < 1 || HAPP_SUBSCRIPTION_PORT > 65535)); then
+    log_err "HAPP_SUBSCRIPTION_PORT must be a valid TCP port (1-65535)"
+    exit 1
+  fi
+}
+
+configure_happ_subscription_feed() {
+  local base_dir="/opt/nebula-subscription"
+  local raw_rel_path="${HAPP_SUBSCRIPTION_PATH}.txt"
+  local json_rel_path="${HAPP_SUBSCRIPTION_PATH}.json"
+  local raw_file="${base_dir}${raw_rel_path}"
+  local json_file="${base_dir}${json_rel_path}"
+  local host_for_url="${HAPP_PUBLIC_HOST:-${SERVER_IP}}"
+  local updated_at
+  local push_payload
+  local rc
+
+  mkdir -p "$(dirname "${raw_file}")" "$(dirname "${json_file}")"
+
+  cat >"${raw_file}" <<EOF
+${VLESS_URI}
+${HY2_URI}
+${MT_TLS_URL}
+${MT_DD_URL}
+EOF
+
+  updated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  jq -n \
+    --arg name "${HAPP_PROFILE_NAME}" \
+    --arg updated_at "${updated_at}" \
+    --arg txt_path "${raw_rel_path}" \
+    --arg json_path "${json_rel_path}" \
+    --arg vless_uri "${VLESS_URI}" \
+    --arg hy2_uri "${HY2_URI}" \
+    --arg mt_tls_url "${MT_TLS_URL}" \
+    --arg mt_dd_url "${MT_DD_URL}" \
+    '{
+      profile: $name,
+      updated_at: $updated_at,
+      endpoints: {
+        txt: $txt_path,
+        json: $json_path
+      },
+      entries: [
+        {tag: "nl-reality", type: "vless", uri: $vless_uri},
+        {tag: "nl-hysteria2", type: "hysteria2", uri: $hy2_uri},
+        {tag: "nl-mtproxy-tls", type: "mtproxy", uri: $mt_tls_url},
+        {tag: "nl-mtproxy-dd", type: "mtproxy", uri: $mt_dd_url}
+      ]
+    }' >"${json_file}"
+
+  cat >/etc/systemd/system/nebula-subscription.service <<EOF
+[Unit]
+Description=Nebula subscription feed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${base_dir}
+ExecStart=/usr/bin/env python3 -m http.server ${HAPP_SUBSCRIPTION_PORT} --bind 0.0.0.0 --directory ${base_dir}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable nebula-subscription
+  systemctl restart nebula-subscription
+  systemctl is-active --quiet nebula-subscription
+
+  HAPP_SUB_TXT_URL="http://${host_for_url}:${HAPP_SUBSCRIPTION_PORT}${raw_rel_path}"
+  HAPP_SUB_JSON_URL="http://${host_for_url}:${HAPP_SUBSCRIPTION_PORT}${json_rel_path}"
+
+  if [[ -n "${HAPP_PUSH_URL}" ]]; then
+    push_payload="$(jq -n \
+      --arg profile "${HAPP_PROFILE_NAME}" \
+      --arg txt_url "${HAPP_SUB_TXT_URL}" \
+      --arg json_url "${HAPP_SUB_JSON_URL}" \
+      --arg vless_uri "${VLESS_URI}" \
+      --arg hy2_uri "${HY2_URI}" \
+      --arg mt_tls_url "${MT_TLS_URL}" \
+      --arg mt_dd_url "${MT_DD_URL}" \
+      '{
+        profile: $profile,
+        subscription: {txt: $txt_url, json: $json_url},
+        links: {
+          vless: $vless_uri,
+          hysteria2: $hy2_uri,
+          mtproxy_tls: $mt_tls_url,
+          mtproxy_dd: $mt_dd_url
+        }
+      }')"
+
+    set +e
+    if [[ -n "${HAPP_PUSH_AUTH_HEADER}" ]]; then
+      curl -fsSL -X POST "${HAPP_PUSH_URL}" \
+        -H "Content-Type: application/json" \
+        -H "${HAPP_PUSH_AUTH_HEADER}" \
+        -d "${push_payload}" >/dev/null
+    else
+      curl -fsSL -X POST "${HAPP_PUSH_URL}" \
+        -H "Content-Type: application/json" \
+        -d "${push_payload}" >/dev/null
+    fi
+    rc=$?
+    set -e
+
+    if [[ ${rc} -eq 0 ]]; then
+      log_ok "Happ push webhook delivered."
+    else
+      log_warn "Happ push webhook failed (rc=${rc}), continuing."
+    fi
+  fi
+}
+
 log_step "Preflight"
 log_info "Detected distro: ${OS_PRETTY} (id=${OS_ID}, version=${OS_VERSION})"
 log_info "Package manager: ${PKG_MGR}"
 log_info "Script tested on: Ubuntu 24.04 (other distros are best-effort)"
+if [[ "${HAPP_COMPAT_ENABLED}" -eq 1 ]]; then
+  normalize_happ_settings
+  log_info "Happ-compatible mode: enabled"
+  log_info "Happ feed path: ${HAPP_SUBSCRIPTION_PATH} (port ${HAPP_SUBSCRIPTION_PORT})"
+else
+  log_info "Happ-compatible mode: disabled"
+fi
 log_ok "Preflight checks passed"
 
 log_step "Preflight backup (best-effort)"
@@ -395,6 +558,14 @@ HY2_URI="hysteria2://${HY2_PASSWORD}@${SERVER_IP}:443/?insecure=1&sni=${HY2_SNI}
 MT_TLS_URL="https://t.me/proxy?server=${SERVER_IP}&port=7443&secret=${MT_TLS_SECRET}"
 MT_DD_URL="https://t.me/proxy?server=${SERVER_IP}&port=7443&secret=dd${MTPROXY_SECRET}"
 
+HAPP_SUB_TXT_URL=""
+HAPP_SUB_JSON_URL=""
+if [[ "${HAPP_COMPAT_ENABLED}" -eq 1 ]]; then
+  log_step "Configuring Happ-compatible subscription feed"
+  configure_happ_subscription_feed
+  log_ok "Happ-compatible feed is active"
+fi
+
 SUMMARY_FILE="/root/nl-gateway-secrets-$(date +%Y%m%d-%H%M%S).txt"
 cat >"${SUMMARY_FILE}" <<EOF
 Server IP: ${SERVER_IP}
@@ -427,8 +598,27 @@ Telegram DD URL:
 ${MT_DD_URL}
 EOF
 
+if [[ "${HAPP_COMPAT_ENABLED}" -eq 1 ]]; then
+  cat >>"${SUMMARY_FILE}" <<EOF
+
+=== Happ-compatible feed ===
+Profile name: ${HAPP_PROFILE_NAME}
+TXT subscription URL:
+${HAPP_SUB_TXT_URL}
+JSON subscription URL:
+${HAPP_SUB_JSON_URL}
+Note:
+Open this URL in Happ/custom client subscription import.
+If not reachable from internet, open port ${HAPP_SUBSCRIPTION_PORT}/tcp on firewall/provider side.
+EOF
+fi
+
 log_step "Final status"
-ss -tulpn | grep -E '(:443\b|:7443\b|xray|hysteria|mtproto)' || true
+STATUS_FILTER='(:443\b|:7443\b|xray|hysteria|mtproto)'
+if [[ "${HAPP_COMPAT_ENABLED}" -eq 1 ]]; then
+  STATUS_FILTER="${STATUS_FILTER}|(:${HAPP_SUBSCRIPTION_PORT}\\b|nebula-subscription)"
+fi
+ss -tulpn | grep -E "${STATUS_FILTER}" || true
 
 echo
 log_ok "Done. Summary saved to: ${SUMMARY_FILE}"
@@ -443,3 +633,11 @@ echo "MTProxy (TLS):"
 echo "${MT_TLS_URL}"
 echo "MTProxy (DD):"
 echo "${MT_DD_URL}"
+
+if [[ "${HAPP_COMPAT_ENABLED}" -eq 1 ]]; then
+  echo
+  echo "Happ-compatible TXT subscription:"
+  echo "${HAPP_SUB_TXT_URL}"
+  echo "Happ-compatible JSON subscription:"
+  echo "${HAPP_SUB_JSON_URL}"
+fi

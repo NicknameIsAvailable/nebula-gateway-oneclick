@@ -7,6 +7,10 @@ One-click разворачивание VPN/anti-censorship шлюза на уд�
 - `Hysteria2` на `UDP 443`
 - `MTProxy (FakeTLS)` на `TCP 7443`
 
+Опционально можно включить **Happ/Voxi-compatible subscription feed**:
+- токенизированная `txt/json` подписка,
+- отдельный HTTP feed-сервис (`systemd`) на настраиваемом порту.
+
 Цель: иметь устойчивый доступ, даже если один из транспортов/ASN режется.
 
 ## Структура репозитория
@@ -21,6 +25,7 @@ One-click разворачивание VPN/anti-censorship шлюза на уд�
 - Локально: Python 3.9+
 - На сервере: Linux + `systemd` + `sudo`/`root` доступ + интернет
 - Открытые порты на VPS: `443/TCP`, `443/UDP`, `7443/TCP`
+- Если включаешь `HAPP_COMPAT_MODE=1`: дополнительно открой `HAPP_SUBSCRIPTION_PORT/TCP` (по умолчанию `18080`).
 
 ## Поддержка дистрибутивов
 
@@ -67,6 +72,17 @@ python deploy.py
 - `LOCAL_ARTIFACTS_DIR=./artifacts` — куда сохранять итоговый отчёт
 - `SKIP_PREFLIGHT_BACKUP=0` — запускать ли preflight backup перед изменениями
 
+### Happ/Voxi-compatible layer (опционально)
+
+- `HAPP_COMPAT_MODE=1` — включает генерацию подписочного feed
+- `HAPP_PROFILE_NAME=nebula-gateway` — имя профиля в json
+- `HAPP_SUBSCRIPTION_TOKEN=` — токен (если пусто, сгенерируется)
+- `HAPP_SUBSCRIPTION_PORT=18080` — порт feed-сервиса
+- `HAPP_SUBSCRIPTION_PATH=/sub/nebula` — путь подписки (без домена)
+- `HAPP_PUBLIC_HOST=` — домен/IP для публичных URL (если пусто, используется обнаруженный IP сервера)
+- `HAPP_PUSH_URL=` — optional webhook для синка со внешней панелью
+- `HAPP_PUSH_AUTH_HEADER=` — optional auth header для webhook (например `Authorization: Bearer ...`)
+
 ### Для восстановления старых профилей (Disaster Recovery)
 
 Если хочешь после переезда на новый VPS сохранить прежние клиентские профили, задай те же значения:
@@ -107,6 +123,7 @@ python deploy.py
     - пишет конфиг Xray и стартует сервис,
     - ставит и настраивает Hysteria2,
     - собирает/настраивает MTProxy,
+    - (опционально) поднимает Happ-compatible subscription feed,
     - включает автозапуск всех сервисов,
     - печатает клиентские ссылки.
 11. `deploy.py` ищет путь к summary-файлу в выводе.
@@ -119,6 +136,8 @@ python deploy.py
 - Если у провайдера/оператора режется конкретный ASN/IP, используй второй VPS и такой же деплой.
 - После успешного деплоя рекомендуется сменить SSH-пароль и перейти на ключевую авторизацию.
 - Для Windows запуск обычно: `py deploy.py` (если `python` не прописан в PATH).
+- `HAPP_COMPAT_MODE` не является “официальной интеграцией VoxiProxy”, а совместимым слоем с подпиской/линками, который можно подключить к своему клиентскому флоу.
+- В текущей версии подписка выдаётся по `http://` (без TLS). Для production лучше повесить её за reverse-proxy с HTTPS.
 
 ## Пример команды с явным env-файлом
 
