@@ -1,126 +1,126 @@
 # Nebula Gateway OneClick
 
-One-click разворачивание VPN/anti-censorship шлюза на удалённом сервере по SSH.
+One-click оркестратор развёртывания VPN/anti-censorship стека по SSH.
 
-Проект поднимает **три независимых транспорта**:
+Поддерживаются два режима:
+- `single` — классический деплой одного NL gateway (Xray + Hysteria2 + MTProxy)
+- `chain` — цепочка `Home -> NL` на VLESS (Home как bridge, NL как exit через x-ui inbound `xhttp+packet-up`)
+
+## Что поднимает проект
+
+### `single` mode
 - `Xray VLESS + Reality` на `TCP 443`
 - `Hysteria2` на `UDP 443`
 - `MTProxy (FakeTLS)` на `TCP 7443`
+- опционально `Happ/Voxi-compatible subscription feed`
 
-Цель: иметь устойчивый доступ, даже если один из транспортов/ASN режется.
+### `chain` mode
+- на `HOME` сервере:
+  - обновляет Xray-конфиг bridge-узла,
+  - сохраняет текущую identity `phone-in` (UUID при `CHAIN_KEEP_HOME_CLIENT_UUID=1`),
+  - настраивает outbound `to-nl` как `vless + reality + xhttp(packet-up)`,
+  - включает full tunnel для клиентского входа (`phone-in -> to-nl`) c тех-исключениями (`localhost/private/tailscale`),
+  - выполняет smoke через локальный `socks`.
+- на `EXIT (NL)` сервере:
+  - ничего не перезаписывает,
+  - только read-only проверяет x-ui inbound по `CHAIN_XUI_INBOUND_REMARK`.
 
 ## Структура репозитория
 
-- `deploy.py` — локальный кроссплатформенный оркестратор (запускается у пользователя на ПК)
-- `scripts/rebuild_nl_gateway.sh` — удалённый bootstrap-скрипт (выполняется на VPS)
+- `deploy.py` — локальный кроссплатформенный оркестратор
+- `scripts/rebuild_nl_gateway.sh` — удалённый bootstrap для `single`
+- `scripts/rebuild_home_chain_bridge.sh` — удалённый bootstrap для `chain` (HOME)
 - `.env.example` — пример конфигурации
 - `requirements.txt` — зависимости локального оркестратора
 
 ## Требования
 
 - Локально: Python 3.9+
-- На сервере: Linux + `systemd` + `sudo`/`root` доступ + интернет
-- Открытые порты на VPS: `443/TCP`, `443/UDP`, `7443/TCP`
+- На серверах: Linux + `systemd` + SSH доступ
+- Для `single` нужны открытые порты на NL VPS: `443/TCP`, `443/UDP`, `7443/TCP`
+- Для `chain`:
+  - HOME должен быть доступен извне по клиентскому порту (обычно `443/TCP`),
+  - на EXIT в x-ui должен существовать отдельный inbound с `network=xhttp`, `xhttpSettings.mode=packet-up` и отдельным портом (не `443`),
+  - inbound remark по умолчанию: `HOME-CHAIN-XHTTP`.
 
-## Поддержка дистрибутивов
-
-Скрипт пытается работать на популярных Linux-дистрибутивах (best-effort):
-- Ubuntu / Debian (`apt`)
-- Fedora / RHEL / Alma / Rocky (`dnf`/`yum`)
-- Arch (`pacman`)
-- openSUSE (`zypper`)
-
-Проверено руками на:
-- **Ubuntu 24.04** (эталонная среда)
-
-Если на твоём дистрибутиве что-то не взлетело:
-- сделай патч и закинь PR,
-- мы посмотрим и вольём качественные изменения.
-
-## Быстрый старт (Windows / macOS / Linux)
+## Быстрый старт
 
 1. Скопируй `.env.example` в `.env` (опционально).
-2. Запусти:
+2. Выбери режим через `DEPLOY_MODE=single|chain`.
+3. Запусти:
 
 ```bash
 python deploy.py
 ```
 
-Если `.env` пустой/неполный, скрипт сам спросит нужные параметры в начале.
+Если обязательных полей не хватает и есть TTY, `deploy.py` спросит их интерактивно.
 
 После выполнения:
-- в консоли будут выведены клиентские URI/ссылки,
-- локально появится файл с итоговыми параметрами в `./artifacts`.
+- лог идёт в консоль,
+- summary-файл скачивается в `LOCAL_ARTIFACTS_DIR` (`./artifacts` по умолчанию).
 
 ## Настройка `.env`
 
-### Обязательные
+### Общие
+- `DEPLOY_MODE=single|chain`
+- `AUTO_INSTALL_PARAMIKO=1`
+- `LOCAL_ARTIFACTS_DIR=./artifacts`
 
-- `SSH_HOST` — IP/домен VPS
-- `SSH_USER` — обычно `root`
-- `SSH_PASSWORD` **или** `SSH_PRIVATE_KEY`
+### `single` mode (legacy)
+- SSH: `SSH_HOST`, `SSH_USER`, `SSH_PASSWORD|SSH_PRIVATE_KEY`
+- опционально: `SUDO_PASSWORD`, `REMOTE_SCRIPT_PATH`
+- транспортные параметры и DR-переменные:
+  - `VLESS_UUID`, `REALITY_*`, `HY2_*`, `MTPROXY_*`
+- optional подписка: `HAPP_*`
+- optional backup hooks: `SKIP_PREFLIGHT_BACKUP`, `RESTIC_*`, `BORG_*`
 
-### Часто полезные
+### `chain` mode
+- HOME SSH:
+  - `HOME_SSH_HOST`, `HOME_SSH_USER`, `HOME_SSH_PASSWORD|HOME_SSH_PRIVATE_KEY`
+- EXIT SSH:
+  - `EXIT_SSH_HOST`, `EXIT_SSH_USER`, `EXIT_SSH_PASSWORD|EXIT_SSH_PRIVATE_KEY`
+- EXIT precheck (x-ui):
+  - `CHAIN_EXIT_PROVIDER=xui`
+  - `CHAIN_XUI_DB_PATH=/etc/x-ui/x-ui.db`
+  - `CHAIN_XUI_INBOUND_REMARK=HOME-CHAIN-XHTTP`
+- chain transport contract:
+  - `CHAIN_XHTTP_MODE=packet-up`
+  - `CHAIN_XHTTP_PATH=/`
+- behavior toggles:
+  - `CHAIN_FULL_TUNNEL=1`
+  - `CHAIN_KEEP_HOME_CLIENT_UUID=1`
 
-- `SUDO_PASSWORD` — нужен, если `SSH_USER` не `root`
-- `AUTO_INSTALL_PARAMIKO=1` — автоустановка python-зависимости
-- `LOCAL_ARTIFACTS_DIR=./artifacts` — куда сохранять итоговый отчёт
-- `SKIP_PREFLIGHT_BACKUP=0` — запускать ли preflight backup перед изменениями
+## Подробный сценарий `deploy.py`
 
-### Для восстановления старых профилей (Disaster Recovery)
+### `single`
+1. Читает `.env`, валидирует SSH.
+2. Загружает `scripts/rebuild_nl_gateway.sh` на target.
+3. Пробрасывает single-переменные в окружение удалённого скрипта.
+4. Запускает provisioning под `root/sudo`.
+5. Скачивает summary.
 
-Если хочешь после переезда на новый VPS сохранить прежние клиентские профили, задай те же значения:
-- `VLESS_UUID`
-- `REALITY_PRIVATE_KEY`
-- `REALITY_SHORT_ID`
-- `HY2_PASSWORD`
-- `MTPROXY_SECRET`
-
-Если не задавать — значения будут сгенерированы заново.
-
-### Preflight backup (опционально)
-
-Перед изменениями серверный скрипт пытается сделать backup:
-1. `restic` (если есть `RESTIC_REPOSITORY` + `RESTIC_PASSWORD`)
-2. `borg` (если есть `BORG_REPO` + `BORG_PASSPHRASE`)
-3. `timeshift` (если установлен и настроен)
-
-Если подходящий backup tool не найден/не настроен, шаг будет пропущен с предупреждением.
-
-## Подробный сценарий работы `deploy.py`
-
-1. Читает `.env`.
-2. Проверяет обязательные SSH параметры.
-3. Устанавливает `paramiko` (если отсутствует и `AUTO_INSTALL_PARAMIKO=1`).
-4. Подключается по SSH к VPS.
-5. Загружает `scripts/rebuild_nl_gateway.sh` на VPS.
-6. Выставляет исполняемые права скрипту.
-7. Пробрасывает переменные из `.env` в окружение удалённого скрипта.
-8. Запускает удалённый скрипт под `root`/`sudo`.
-9. Потоково показывает лог выполнения в твоей локальной консоли.
-10. На VPS удалённый скрипт:
-    - определяет дистрибутив и пакетный менеджер,
-    - пытается сделать preflight backup (best-effort),
-    - ставит системные пакеты,
-    - ставит Xray,
-    - генерирует/восстанавливает Reality-ключи,
-    - пишет конфиг Xray и стартует сервис,
-    - ставит и настраивает Hysteria2,
-    - собирает/настраивает MTProxy,
-    - включает автозапуск всех сервисов,
-    - печатает клиентские ссылки.
-11. `deploy.py` ищет путь к summary-файлу в выводе.
-12. Скачивает summary-файл с VPS в локальную папку `artifacts`.
-13. Завершает работу с кодом `0` при успехе.
+### `chain`
+1. Читает `.env`, валидирует SSH для `HOME` и `EXIT`.
+2. Подключается к `EXIT` и делает read-only проверку x-ui inbound:
+   - remark совпадает,
+   - `network=xhttp`, `security=reality`,
+   - `xhttpSettings.mode=packet-up`,
+   - путь совпадает,
+   - порт выделенный (не `443`),
+   - есть usable client UUID,
+   - из private key выводится public key для outbound bridge.
+3. Загружает `scripts/rebuild_home_chain_bridge.sh` на `HOME`.
+4. Пробрасывает chain-параметры (полученные из EXIT + `.env`) в HOME-скрипт.
+5. Применяет HOME bridge-конфиг, делает smoke, скачивает summary.
 
 ## Важные замечания
 
-- Скрипт рассчитан на **чистый/контролируемый VPS**. На сервере с уже установленным альтернативным VPN-стеком может быть конфликт портов.
-- Если у провайдера/оператора режется конкретный ASN/IP, используй второй VPS и такой же деплой.
-- После успешного деплоя рекомендуется сменить SSH-пароль и перейти на ключевую авторизацию.
-- Для Windows запуск обычно: `py deploy.py` (если `python` не прописан в PATH).
+- `chain` режим специально не перезаписывает x-ui DB/конфиги на EXIT.
+- Если precheck EXIT не проходит — deploy завершится ошибкой до изменений на HOME.
+- Для прод-использования фиксируй доступ по SSH-ключам.
+- Для Windows запуск обычно: `py deploy.py`.
 
-## Пример команды с явным env-файлом
+## Пример запуска с явным env
 
 ```bash
 ENV_FILE=/absolute/path/to/.env python deploy.py
@@ -131,4 +131,5 @@ ENV_FILE=/absolute/path/to/.env python deploy.py
 ```bash
 python -m py_compile deploy.py
 bash -n scripts/rebuild_nl_gateway.sh
+bash -n scripts/rebuild_home_chain_bridge.sh
 ```

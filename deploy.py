@@ -1,29 +1,45 @@
 #!/usr/bin/env python3
 """
-Cross-platform one-shot deploy runner for NL gateway stack.
+Cross-platform one-shot deploy runner for Nebula gateway stack.
 Works on Linux/macOS/Windows (where Python 3 is available).
+
+Modes:
+- single: legacy one-server NL gateway provisioning
+- chain: Home -> NL VLESS chain (Home bridge config + NL x-ui read-only precheck)
 """
 
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import textwrap
 import time
 from dataclasses import dataclass
 from getpass import getpass
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_ENV_PATH = SCRIPT_DIR / ".env"
-REMOTE_SCRIPT_LOCAL_PATH = SCRIPT_DIR / "scripts" / "rebuild_nl_gateway.sh"
+REMOTE_SCRIPT_SINGLE_LOCAL_PATH = SCRIPT_DIR / "scripts" / "rebuild_nl_gateway.sh"
+REMOTE_SCRIPT_CHAIN_HOME_LOCAL_PATH = SCRIPT_DIR / "scripts" / "rebuild_home_chain_bridge.sh"
+
+DEFAULT_REMOTE_SCRIPT_SINGLE_PATH = "/tmp/rebuild_nl_gateway.sh"
+DEFAULT_REMOTE_SCRIPT_CHAIN_HOME_PATH = "/tmp/rebuild_home_chain_bridge.sh"
+
+MODE_SINGLE = "single"
+MODE_CHAIN = "chain"
 
 ENV_KEYS_FOR_SAVE = [
+    # Mode
+    "DEPLOY_MODE",
+    # Legacy single-mode SSH
     "SSH_HOST",
     "SSH_PORT",
     "SSH_USER",
@@ -31,9 +47,27 @@ ENV_KEYS_FOR_SAVE = [
     "SSH_PRIVATE_KEY",
     "SSH_KEY_PASSPHRASE",
     "SUDO_PASSWORD",
+    # Chain-mode SSH blocks
+    "HOME_SSH_HOST",
+    "HOME_SSH_PORT",
+    "HOME_SSH_USER",
+    "HOME_SSH_PASSWORD",
+    "HOME_SSH_PRIVATE_KEY",
+    "HOME_SSH_KEY_PASSPHRASE",
+    "HOME_SUDO_PASSWORD",
+    "EXIT_SSH_HOST",
+    "EXIT_SSH_PORT",
+    "EXIT_SSH_USER",
+    "EXIT_SSH_PASSWORD",
+    "EXIT_SSH_PRIVATE_KEY",
+    "EXIT_SSH_KEY_PASSPHRASE",
+    "EXIT_SUDO_PASSWORD",
+    # Local behavior
     "AUTO_INSTALL_PARAMIKO",
     "REMOTE_SCRIPT_PATH",
+    "CHAIN_HOME_REMOTE_SCRIPT_PATH",
     "LOCAL_ARTIFACTS_DIR",
+    # Single-mode gateway settings
     "VLESS_UUID",
     "REALITY_SNI",
     "REALITY_DEST",
@@ -43,11 +77,27 @@ ENV_KEYS_FOR_SAVE = [
     "HY2_PASSWORD",
     "MTPROXY_TLS_DOMAIN",
     "MTPROXY_SECRET",
+    "HAPP_COMPAT_MODE",
+    "HAPP_PROFILE_NAME",
+    "HAPP_SUBSCRIPTION_TOKEN",
+    "HAPP_SUBSCRIPTION_PORT",
+    "HAPP_SUBSCRIPTION_PATH",
+    "HAPP_PUBLIC_HOST",
+    "HAPP_PUSH_URL",
+    "HAPP_PUSH_AUTH_HEADER",
     "SKIP_PREFLIGHT_BACKUP",
     "RESTIC_REPOSITORY",
     "RESTIC_PASSWORD",
     "BORG_REPO",
     "BORG_PASSPHRASE",
+    # Chain-mode controls
+    "CHAIN_EXIT_PROVIDER",
+    "CHAIN_XUI_DB_PATH",
+    "CHAIN_XUI_INBOUND_REMARK",
+    "CHAIN_XHTTP_MODE",
+    "CHAIN_XHTTP_PATH",
+    "CHAIN_FULL_TUNNEL",
+    "CHAIN_KEEP_HOME_CLIENT_UUID",
 ]
 
 PLACEHOLDER_VALUES = {
@@ -175,48 +225,163 @@ def is_placeholder(value: str) -> bool:
     return False
 
 
+def normalize_deploy_mode(value: str) -> str:
+    candidate = (value or MODE_SINGLE).strip().lower()
+    if candidate not in {MODE_SINGLE, MODE_CHAIN}:
+        raise ValueError(f"DEPLOY_MODE must be '{MODE_SINGLE}' or '{MODE_CHAIN}'")
+    return candidate
+
+
+def role_key(role: str, key: str) -> str:
+    return f"{role}_{key}"
+
+
+def normalize_xhttp_path(path_value: str) -> str:
+    path = (path_value or "/").strip()
+    if not path:
+        return "/"
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return path
+
+
 def ensure_interactive_config(config: Dict[str, str], env_path: Path):
     prompted = False
     interactive = sys.stdin.isatty()
 
+    if not env_get(config, "DEPLOY_MODE"):
+        if interactive:
+            config["DEPLOY_MODE"] = normalize_deploy_mode(
+                prompt_text("DEPLOY_MODE (single/chain)", default=MODE_SINGLE)
+            )
+            prompted = True
+        else:
+            config["DEPLOY_MODE"] = MODE_SINGLE
+    else:
+        config["DEPLOY_MODE"] = normalize_deploy_mode(env_get(config, "DEPLOY_MODE"))
+
+    mode = config["DEPLOY_MODE"]
+
+    def set_default(key: str, value: str):
+        if not env_get(config, key):
+            config[key] = value
+
     def need(key: str, default: str = "", secret: bool = False, allow_empty: bool = False):
         nonlocal prompted
-        if config.get(key) and not is_placeholder(config.get(key, "")):
+        existing = env_get(config, key)
+        if existing and not is_placeholder(existing):
             return
         if not interactive:
             raise ValueError(f"{key} is required and no interactive TTY is available")
         prompted = True
         config[key] = prompt_text(key, default=default, secret=secret, allow_empty=allow_empty)
 
-    need("SSH_HOST")
-    need("SSH_PORT", default="22")
-    need("SSH_USER", default="root")
+    def need_role(role: str, key: str, default: str = "", secret: bool = False, allow_empty: bool = False, legacy_key: str = ""):
+        nonlocal prompted
+        rk = role_key(role, key)
+        existing = env_get(config, rk)
+        if existing and not is_placeholder(existing):
+            return
 
-    has_password = config.get("SSH_PASSWORD") and not is_placeholder(config.get("SSH_PASSWORD", ""))
-    has_key = config.get("SSH_PRIVATE_KEY") and not is_placeholder(config.get("SSH_PRIVATE_KEY", ""))
+        if legacy_key:
+            legacy_value = env_get(config, legacy_key)
+            if legacy_value and not is_placeholder(legacy_value):
+                config[rk] = legacy_value
+                return
 
-    if not has_password and not has_key:
         if not interactive:
-            raise ValueError("Set SSH_PASSWORD or SSH_PRIVATE_KEY")
+            raise ValueError(f"{rk} is required and no interactive TTY is available")
+
         prompted = True
-        method = prompt_text("Auth method (password/key)", default="password")
-        if method.lower().startswith("k"):
-            config["SSH_PRIVATE_KEY"] = prompt_text("SSH_PRIVATE_KEY")
-            config["SSH_KEY_PASSPHRASE"] = prompt_text("SSH_KEY_PASSPHRASE", secret=True, allow_empty=True)
-        else:
-            config["SSH_PASSWORD"] = prompt_text("SSH_PASSWORD", secret=True)
+        config[rk] = prompt_text(rk, default=default, secret=secret, allow_empty=allow_empty)
 
-    if config.get("SSH_USER", "root") != "root" and not config.get("SUDO_PASSWORD"):
-        if interactive:
+    set_default("AUTO_INSTALL_PARAMIKO", "1")
+    set_default("LOCAL_ARTIFACTS_DIR", "./artifacts")
+
+    if mode == MODE_SINGLE:
+        need("SSH_HOST")
+        need("SSH_PORT", default="22")
+        need("SSH_USER", default="root")
+
+        has_password = env_get(config, "SSH_PASSWORD") and not is_placeholder(env_get(config, "SSH_PASSWORD"))
+        has_key = env_get(config, "SSH_PRIVATE_KEY") and not is_placeholder(env_get(config, "SSH_PRIVATE_KEY"))
+
+        if not has_password and not has_key:
+            if not interactive:
+                raise ValueError("Set SSH_PASSWORD or SSH_PRIVATE_KEY")
             prompted = True
-            config["SUDO_PASSWORD"] = prompt_text("SUDO_PASSWORD (optional)", secret=True, allow_empty=True)
+            method = prompt_text("Auth method (password/key)", default="password")
+            if method.lower().startswith("k"):
+                config["SSH_PRIVATE_KEY"] = prompt_text("SSH_PRIVATE_KEY")
+                config["SSH_KEY_PASSPHRASE"] = prompt_text("SSH_KEY_PASSPHRASE", secret=True, allow_empty=True)
+            else:
+                config["SSH_PASSWORD"] = prompt_text("SSH_PASSWORD", secret=True)
 
-    if not config.get("AUTO_INSTALL_PARAMIKO"):
-        config["AUTO_INSTALL_PARAMIKO"] = "1"
-    if not config.get("REMOTE_SCRIPT_PATH"):
-        config["REMOTE_SCRIPT_PATH"] = "/tmp/rebuild_nl_gateway.sh"
-    if not config.get("LOCAL_ARTIFACTS_DIR"):
-        config["LOCAL_ARTIFACTS_DIR"] = "./artifacts"
+        if env_get(config, "SSH_USER", "root") != "root" and not env_get(config, "SUDO_PASSWORD"):
+            if interactive:
+                prompted = True
+                config["SUDO_PASSWORD"] = prompt_text("SUDO_PASSWORD (optional)", secret=True, allow_empty=True)
+
+        set_default("REMOTE_SCRIPT_PATH", DEFAULT_REMOTE_SCRIPT_SINGLE_PATH)
+
+    else:
+        # Seed HOME_* from legacy single-mode keys for convenience.
+        legacy_seed_map = {
+            "SSH_HOST": "SSH_HOST",
+            "SSH_PORT": "SSH_PORT",
+            "SSH_USER": "SSH_USER",
+            "SSH_PASSWORD": "SSH_PASSWORD",
+            "SSH_PRIVATE_KEY": "SSH_PRIVATE_KEY",
+            "SSH_KEY_PASSPHRASE": "SSH_KEY_PASSPHRASE",
+            "SUDO_PASSWORD": "SUDO_PASSWORD",
+        }
+        for suffix, legacy in legacy_seed_map.items():
+            rk = role_key("HOME", suffix)
+            if not env_get(config, rk) and env_get(config, legacy):
+                config[rk] = env_get(config, legacy)
+
+        for role in ("HOME", "EXIT"):
+            need_role(role, "SSH_HOST")
+            need_role(role, "SSH_PORT", default="22")
+            need_role(role, "SSH_USER", default="root")
+
+            role_password = env_get(config, role_key(role, "SSH_PASSWORD"))
+            role_key_path = env_get(config, role_key(role, "SSH_PRIVATE_KEY"))
+            has_password = role_password and not is_placeholder(role_password)
+            has_key = role_key_path and not is_placeholder(role_key_path)
+
+            if not has_password and not has_key:
+                if not interactive:
+                    raise ValueError(f"Set {role}_SSH_PASSWORD or {role}_SSH_PRIVATE_KEY")
+                prompted = True
+                method = prompt_text(f"{role} auth method (password/key)", default="password")
+                if method.lower().startswith("k"):
+                    config[role_key(role, "SSH_PRIVATE_KEY")] = prompt_text(role_key(role, "SSH_PRIVATE_KEY"))
+                    config[role_key(role, "SSH_KEY_PASSPHRASE")] = prompt_text(
+                        role_key(role, "SSH_KEY_PASSPHRASE"),
+                        secret=True,
+                        allow_empty=True,
+                    )
+                else:
+                    config[role_key(role, "SSH_PASSWORD")] = prompt_text(role_key(role, "SSH_PASSWORD"), secret=True)
+
+            if env_get(config, role_key(role, "SSH_USER"), "root") != "root" and not env_get(config, role_key(role, "SUDO_PASSWORD")):
+                if interactive:
+                    prompted = True
+                    config[role_key(role, "SUDO_PASSWORD")] = prompt_text(
+                        f"{role}_SUDO_PASSWORD (optional)",
+                        secret=True,
+                        allow_empty=True,
+                    )
+
+        set_default("CHAIN_HOME_REMOTE_SCRIPT_PATH", DEFAULT_REMOTE_SCRIPT_CHAIN_HOME_PATH)
+        set_default("CHAIN_EXIT_PROVIDER", "xui")
+        set_default("CHAIN_XUI_DB_PATH", "/etc/x-ui/x-ui.db")
+        set_default("CHAIN_XUI_INBOUND_REMARK", "HOME-CHAIN-XHTTP")
+        set_default("CHAIN_XHTTP_MODE", "packet-up")
+        set_default("CHAIN_XHTTP_PATH", "/")
+        set_default("CHAIN_FULL_TUNNEL", "1")
+        set_default("CHAIN_KEEP_HOME_CLIENT_UUID", "1")
 
     if prompted and interactive:
         save_choice = prompt_text("Save entered values to .env? (y/N)", default="n", allow_empty=True).lower()
@@ -246,9 +411,10 @@ class SSHConfig:
     key_path: str
     key_passphrase: str
     sudo_password: str
+    label: str
 
 
-def build_ssh_config(config: Dict[str, str]) -> SSHConfig:
+def build_single_ssh_config(config: Dict[str, str]) -> SSHConfig:
     host = env_get(config, "SSH_HOST")
     if not host:
         raise ValueError("SSH_HOST is required")
@@ -271,6 +437,56 @@ def build_ssh_config(config: Dict[str, str]) -> SSHConfig:
         key_path=key_path,
         key_passphrase=key_passphrase,
         sudo_password=sudo_password,
+        label="single-target",
+    )
+
+
+def build_role_ssh_config(config: Dict[str, str], role: str) -> SSHConfig:
+    host = env_get(config, role_key(role, "SSH_HOST"))
+    if not host and role == "HOME":
+        host = env_get(config, "SSH_HOST")
+
+    if not host:
+        raise ValueError(f"{role}_SSH_HOST is required")
+
+    port_raw = env_get(config, role_key(role, "SSH_PORT"))
+    if not port_raw and role == "HOME":
+        port_raw = env_get(config, "SSH_PORT", "22")
+    port = int(port_raw or "22")
+
+    user = env_get(config, role_key(role, "SSH_USER"))
+    if not user and role == "HOME":
+        user = env_get(config, "SSH_USER", "root")
+    user = user or "root"
+
+    password = env_get(config, role_key(role, "SSH_PASSWORD"))
+    if not password and role == "HOME":
+        password = env_get(config, "SSH_PASSWORD")
+
+    key_path = env_get(config, role_key(role, "SSH_PRIVATE_KEY"))
+    if not key_path and role == "HOME":
+        key_path = env_get(config, "SSH_PRIVATE_KEY")
+
+    key_passphrase = env_get(config, role_key(role, "SSH_KEY_PASSPHRASE"))
+    if not key_passphrase and role == "HOME":
+        key_passphrase = env_get(config, "SSH_KEY_PASSPHRASE")
+
+    sudo_password = env_get(config, role_key(role, "SUDO_PASSWORD"))
+    if not sudo_password and role == "HOME":
+        sudo_password = env_get(config, "SUDO_PASSWORD")
+
+    if not password and not key_path:
+        raise ValueError(f"Set {role}_SSH_PASSWORD or {role}_SSH_PRIVATE_KEY")
+
+    return SSHConfig(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        key_path=key_path,
+        key_passphrase=key_passphrase,
+        sudo_password=sudo_password,
+        label=role.lower(),
     )
 
 
@@ -336,6 +552,15 @@ def run_streaming(client, command: str) -> Tuple[int, str]:
     return status, "".join(combined)
 
 
+def run_capture(client, command: str) -> Tuple[int, str]:
+    stdin, stdout, stderr = client.exec_command(command)
+    del stdin
+    out = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace")
+    code = stdout.channel.recv_exit_status()
+    return code, out + err
+
+
 def remote_env_exports(config: Dict[str, str]) -> str:
     keys = [
         "VLESS_UUID",
@@ -347,6 +572,14 @@ def remote_env_exports(config: Dict[str, str]) -> str:
         "HY2_PASSWORD",
         "MTPROXY_TLS_DOMAIN",
         "MTPROXY_SECRET",
+        "HAPP_COMPAT_MODE",
+        "HAPP_PROFILE_NAME",
+        "HAPP_SUBSCRIPTION_TOKEN",
+        "HAPP_SUBSCRIPTION_PORT",
+        "HAPP_SUBSCRIPTION_PATH",
+        "HAPP_PUBLIC_HOST",
+        "HAPP_PUSH_URL",
+        "HAPP_PUSH_AUTH_HEADER",
         "SKIP_PREFLIGHT_BACKUP",
         "RESTIC_REPOSITORY",
         "RESTIC_PASSWORD",
@@ -361,6 +594,32 @@ def remote_env_exports(config: Dict[str, str]) -> str:
             parts.append(f"{key}={shlex.quote(value)}")
 
     return " ".join(parts)
+
+
+def env_exports_from_mapping(mapping: Dict[str, str]) -> str:
+    parts: list[str] = []
+    for key, value in mapping.items():
+        if value is None:
+            continue
+        text = str(value)
+        if text == "":
+            continue
+        parts.append(f"{key}={shlex.quote(text)}")
+    return " ".join(parts)
+
+
+def build_privileged_remote_command(cfg: SSHConfig, command: str) -> str:
+    payload = f"set -euo pipefail; {command}"
+    if cfg.user == "root":
+        return f"bash -lc {shlex.quote(payload)}"
+
+    if cfg.sudo_password:
+        return (
+            f"echo {shlex.quote(cfg.sudo_password)} | "
+            f"sudo -S -E bash -lc {shlex.quote(payload)}"
+        )
+
+    return f"sudo -E bash -lc {shlex.quote(payload)}"
 
 
 def download_summary_if_any(client, output: str, host: str, artifacts_dir: Path) -> Path | None:
@@ -383,31 +642,271 @@ def download_summary_if_any(client, output: str, host: str, artifacts_dir: Path)
     return local_path
 
 
-def main() -> int:
-    total_steps = 7
+def build_chain_xui_probe_command(config: Dict[str, str]) -> str:
+    db_path = env_get(config, "CHAIN_XUI_DB_PATH", "/etc/x-ui/x-ui.db")
+    remark = env_get(config, "CHAIN_XUI_INBOUND_REMARK", "HOME-CHAIN-XHTTP")
+    expected_mode = env_get(config, "CHAIN_XHTTP_MODE", "packet-up")
+    expected_path = normalize_xhttp_path(env_get(config, "CHAIN_XHTTP_PATH", "/"))
+
+    python_code = textwrap.dedent(
+        f"""
+        import json
+        import os
+        import sqlite3
+        import subprocess
+        import sys
+
+        DB_PATH = {json.dumps(db_path)}
+        REMARK = {json.dumps(remark)}
+        EXPECTED_MODE = {json.dumps(expected_mode)}
+        EXPECTED_PATH = {json.dumps(expected_path)}
+
+        def emit(payload, code):
+            print(json.dumps(payload, ensure_ascii=False))
+            sys.exit(code)
+
+        if not os.path.exists(DB_PATH):
+            emit({{"ok": False, "error": "db_not_found", "db_path": DB_PATH}}, 2)
+
+        try:
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+        except Exception as exc:
+            emit({{"ok": False, "error": "db_open_failed", "details": str(exc)}}, 2)
+
+        rows = cur.execute(
+            "SELECT id, remark, port, protocol, enable, settings, stream_settings "
+            "FROM inbounds WHERE remark = ? ORDER BY id DESC",
+            (REMARK,),
+        ).fetchall()
+
+        if not rows:
+            available = cur.execute(
+                "SELECT id, remark, port, protocol, enable FROM inbounds ORDER BY id"
+            ).fetchall()
+            emit(
+                {{
+                    "ok": False,
+                    "error": "inbound_not_found",
+                    "remark": REMARK,
+                    "available": [
+                        {{
+                            "id": r[0],
+                            "remark": r[1],
+                            "port": r[2],
+                            "protocol": r[3],
+                            "enable": r[4],
+                        }}
+                        for r in available
+                    ],
+                }},
+                3,
+            )
+
+        row = rows[0]
+        inbound_id, inbound_remark, port, protocol, enable, settings_raw, stream_raw = row
+
+        try:
+            settings = json.loads(settings_raw) if settings_raw else {{}}
+        except Exception:
+            settings = {{}}
+
+        try:
+            stream = json.loads(stream_raw) if stream_raw else {{}}
+        except Exception:
+            stream = {{}}
+
+        if protocol != "vless":
+            emit({{"ok": False, "error": "invalid_protocol", "protocol": protocol}}, 4)
+
+        if int(enable) != 1:
+            emit({{"ok": False, "error": "inbound_disabled", "enable": int(enable)}}, 4)
+
+        network = stream.get("network")
+        security = stream.get("security")
+        xhttp = stream.get("xhttpSettings") or {{}}
+        reality = stream.get("realitySettings") or {{}}
+
+        xhttp_mode = xhttp.get("mode")
+        xhttp_path = xhttp.get("path") or "/"
+
+        if network != "xhttp":
+            emit({{"ok": False, "error": "invalid_network", "network": network}}, 5)
+
+        if security != "reality":
+            emit({{"ok": False, "error": "invalid_security", "security": security}}, 5)
+
+        if xhttp_mode != EXPECTED_MODE:
+            emit(
+                {{
+                    "ok": False,
+                    "error": "xhttp_mode_mismatch",
+                    "expected": EXPECTED_MODE,
+                    "actual": xhttp_mode,
+                }},
+                5,
+            )
+
+        if xhttp_path != EXPECTED_PATH:
+            emit(
+                {{
+                    "ok": False,
+                    "error": "xhttp_path_mismatch",
+                    "expected": EXPECTED_PATH,
+                    "actual": xhttp_path,
+                }},
+                5,
+            )
+
+        if int(port) == 443:
+            emit(
+                {{
+                    "ok": False,
+                    "error": "port_conflict",
+                    "details": "chain inbound must use dedicated port, not 443",
+                    "port": int(port),
+                }},
+                5,
+            )
+
+        server_names = reality.get("serverNames") or []
+        if not isinstance(server_names, list):
+            server_names = []
+
+        short_ids = reality.get("shortIds") or []
+        if not isinstance(short_ids, list):
+            short_ids = []
+
+        server_name = next((s for s in server_names if isinstance(s, str) and s.strip()), "")
+        short_id = next((s for s in short_ids if isinstance(s, str) and s.strip()), "")
+        reality_dest = reality.get("dest") or ""
+        reality_private_key = reality.get("privateKey") or ""
+
+        if not server_name:
+            emit({{"ok": False, "error": "missing_reality_server_name"}}, 6)
+        if not short_id:
+            emit({{"ok": False, "error": "missing_reality_short_id"}}, 6)
+        if not reality_dest:
+            emit({{"ok": False, "error": "missing_reality_dest"}}, 6)
+        if not reality_private_key:
+            emit({{"ok": False, "error": "missing_reality_private_key"}}, 6)
+
+        clients = settings.get("clients") if isinstance(settings, dict) else []
+        if not isinstance(clients, list):
+            clients = []
+
+        selected_client = None
+        for client in clients:
+            if isinstance(client, dict) and client.get("email") == "home-relay@chain" and client.get("id"):
+                selected_client = client
+                break
+
+        if selected_client is None:
+            for client in clients:
+                if isinstance(client, dict) and client.get("id"):
+                    selected_client = client
+                    break
+
+        if not selected_client:
+            emit({{"ok": False, "error": "missing_client_uuid"}}, 7)
+
+        client_id = selected_client.get("id")
+        client_email = selected_client.get("email") or ""
+        client_flow = selected_client.get("flow") or ""
+
+        def parse_public_key(text: str):
+            for line in text.splitlines():
+                if (
+                    "Public key:" in line
+                    or "PublicKey:" in line
+                    or "Password (PublicKey):" in line
+                    or "Password:" in line
+                ):
+                    return line.split(":", 1)[1].strip()
+            return ""
+
+        xray_bins = [
+            "/usr/local/x-ui/bin/xray-linux-amd64",
+            "/usr/local/bin/xray",
+            "/usr/bin/xray",
+            "xray",
+        ]
+
+        reality_public_key = ""
+        used_bin = ""
+        for xray_bin in xray_bins:
+            try:
+                proc = subprocess.run(
+                    [xray_bin, "x25519", "-i", reality_private_key],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
+            except FileNotFoundError:
+                continue
+
+            if proc.returncode != 0:
+                continue
+
+            parsed = parse_public_key(proc.stdout)
+            if parsed:
+                reality_public_key = parsed
+                used_bin = xray_bin
+                break
+
+        if not reality_public_key:
+            emit({{"ok": False, "error": "public_key_derive_failed"}}, 8)
+
+        emit(
+            {{
+                "ok": True,
+                "provider": "xui",
+                "db_path": DB_PATH,
+                "inbound_id": int(inbound_id),
+                "remark": inbound_remark,
+                "port": int(port),
+                "network": network,
+                "security": security,
+                "xhttp_mode": xhttp_mode,
+                "xhttp_path": xhttp_path,
+                "reality_server_name": server_name,
+                "reality_dest": reality_dest,
+                "reality_short_id": short_id,
+                "reality_public_key": reality_public_key,
+                "client_id": client_id,
+                "client_email": client_email,
+                "client_flow": client_flow,
+                "xray_bin": used_bin,
+            }},
+            0,
+        )
+        """
+    ).strip()
+
+    return f"python3 - <<'PY'\n{python_code}\nPY"
+
+
+def parse_probe_payload(output: str) -> Dict[str, Any]:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if line.startswith("{") and line.endswith("}"):
+            return json.loads(line)
+    raise ValueError("Unable to parse probe JSON output")
+
+
+def run_single_mode(config: Dict[str, str], paramiko) -> int:
+    total_steps = 5
     step = 0
 
-    UI.header("Nebula Gateway OneClick")
-
     step += 1
-    UI.step(step, total_steps, "Loading config")
-    env_path = Path(os.environ.get("ENV_FILE", str(DEFAULT_ENV_PATH))).resolve()
-    config = parse_dotenv(env_path)
-    ensure_interactive_config(config, env_path)
-    UI.ok(f"Using config file: {env_path}")
+    UI.step(step, total_steps, "Validating single-mode SSH config")
+    ssh_cfg = build_single_ssh_config(config)
 
-    step += 1
-    UI.step(step, total_steps, "Checking local dependencies")
-    auto_install = as_bool(env_get(config, "AUTO_INSTALL_PARAMIKO", "1"), default=True)
-    paramiko = ensure_paramiko(auto_install)
-    UI.ok("paramiko is ready")
+    if not REMOTE_SCRIPT_SINGLE_LOCAL_PATH.exists():
+        raise FileNotFoundError(f"Remote script not found: {REMOTE_SCRIPT_SINGLE_LOCAL_PATH}")
 
-    step += 1
-    UI.step(step, total_steps, "Validating SSH config")
-    ssh_cfg = build_ssh_config(config)
-    if not REMOTE_SCRIPT_LOCAL_PATH.exists():
-        raise FileNotFoundError(f"Remote script not found: {REMOTE_SCRIPT_LOCAL_PATH}")
-    remote_script_path = env_get(config, "REMOTE_SCRIPT_PATH", "/tmp/rebuild_nl_gateway.sh")
+    remote_script_path = env_get(config, "REMOTE_SCRIPT_PATH", DEFAULT_REMOTE_SCRIPT_SINGLE_PATH)
     artifacts_dir = Path(env_get(config, "LOCAL_ARTIFACTS_DIR", str(SCRIPT_DIR / "artifacts"))).resolve()
     UI.ok(f"Target: {ssh_cfg.user}@{ssh_cfg.host}:{ssh_cfg.port}")
 
@@ -421,31 +920,21 @@ def main() -> int:
         UI.step(step, total_steps, "Uploading bootstrap script")
         sftp = client.open_sftp()
         try:
-            sftp.put(str(REMOTE_SCRIPT_LOCAL_PATH), remote_script_path)
+            sftp.put(str(REMOTE_SCRIPT_SINGLE_LOCAL_PATH), remote_script_path)
         finally:
             sftp.close()
-        run_streaming(client, f"chmod +x {shlex.quote(remote_script_path)}")
+
+        chmod_cmd = build_privileged_remote_command(ssh_cfg, f"chmod +x {shlex.quote(remote_script_path)}")
+        code, chmod_out = run_capture(client, chmod_cmd)
+        if code != 0:
+            raise RuntimeError(f"Failed to chmod remote script:\n{chmod_out}")
         UI.ok(f"Uploaded to {remote_script_path}")
 
         step += 1
         UI.step(step, total_steps, "Executing remote provisioning")
         exports = remote_env_exports(config)
-        exports_prefix = f"{exports} " if exports else ""
-
-        if ssh_cfg.user == "root":
-            remote_cmd = f"set -euo pipefail; {exports_prefix}bash {shlex.quote(remote_script_path)}"
-        else:
-            if ssh_cfg.sudo_password:
-                remote_cmd = (
-                    "set -euo pipefail; "
-                    f"{exports_prefix}echo {shlex.quote(ssh_cfg.sudo_password)} | "
-                    f"sudo -S -E bash {shlex.quote(remote_script_path)}"
-                )
-            else:
-                remote_cmd = (
-                    "set -euo pipefail; "
-                    f"{exports_prefix}sudo -E bash {shlex.quote(remote_script_path)}"
-                )
+        command = f"{exports} bash {shlex.quote(remote_script_path)}" if exports else f"bash {shlex.quote(remote_script_path)}"
+        remote_cmd = build_privileged_remote_command(ssh_cfg, command)
 
         code, output = run_streaming(client, remote_cmd)
         if code != 0:
@@ -462,10 +951,164 @@ def main() -> int:
             UI.warn("Summary path not detected in output")
 
         UI.header("Done")
-        UI.ok("Gateway deployment finished successfully")
+        UI.ok("Single-server deployment finished successfully")
         return 0
     finally:
         client.close()
+
+
+def run_chain_mode(config: Dict[str, str], paramiko) -> int:
+    total_steps = 8
+    step = 0
+
+    step += 1
+    UI.step(step, total_steps, "Validating chain-mode config")
+    chain_provider = env_get(config, "CHAIN_EXIT_PROVIDER", "xui").strip().lower()
+    if chain_provider != "xui":
+        raise ValueError("CHAIN_EXIT_PROVIDER currently supports only 'xui'")
+
+    chain_xhttp_mode = env_get(config, "CHAIN_XHTTP_MODE", "packet-up")
+    chain_xhttp_path = normalize_xhttp_path(env_get(config, "CHAIN_XHTTP_PATH", "/"))
+    config["CHAIN_XHTTP_PATH"] = chain_xhttp_path
+
+    home_cfg = build_role_ssh_config(config, "HOME")
+    exit_cfg = build_role_ssh_config(config, "EXIT")
+
+    if not REMOTE_SCRIPT_CHAIN_HOME_LOCAL_PATH.exists():
+        raise FileNotFoundError(f"Home chain script not found: {REMOTE_SCRIPT_CHAIN_HOME_LOCAL_PATH}")
+
+    home_remote_script_path = env_get(config, "CHAIN_HOME_REMOTE_SCRIPT_PATH", DEFAULT_REMOTE_SCRIPT_CHAIN_HOME_PATH)
+    artifacts_dir = Path(env_get(config, "LOCAL_ARTIFACTS_DIR", str(SCRIPT_DIR / "artifacts"))).resolve()
+
+    UI.ok(f"Home target: {home_cfg.user}@{home_cfg.host}:{home_cfg.port}")
+    UI.ok(f"Exit target: {exit_cfg.user}@{exit_cfg.host}:{exit_cfg.port}")
+
+    step += 1
+    UI.step(step, total_steps, "Connecting to EXIT server")
+    exit_client = connect_ssh(paramiko, exit_cfg)
+    UI.ok("EXIT SSH connection established")
+
+    try:
+        step += 1
+        UI.step(step, total_steps, "Validating x-ui inbound for chain")
+        probe_command = build_chain_xui_probe_command(config)
+        remote_probe = build_privileged_remote_command(exit_cfg, probe_command)
+        code, probe_output = run_capture(exit_client, remote_probe)
+        try:
+            payload = parse_probe_payload(probe_output)
+        except Exception:
+            payload = {
+                "ok": False,
+                "error": "probe_output_parse_failed",
+                "raw_output": probe_output.strip()[-4000:],
+            }
+
+        if code != 0 or not payload.get("ok"):
+            details = json.dumps(payload, ensure_ascii=False, indent=2) if isinstance(payload, dict) else probe_output
+            raise RuntimeError(f"EXIT precheck failed:\n{details}")
+
+        UI.ok(
+            "EXIT chain inbound is valid: "
+            f"remark={payload.get('remark')} port={payload.get('port')} "
+            f"mode={payload.get('xhttp_mode')} path={payload.get('xhttp_path')}"
+        )
+    finally:
+        exit_client.close()
+
+    step += 1
+    UI.step(step, total_steps, "Connecting to HOME server")
+    home_client = connect_ssh(paramiko, home_cfg)
+    UI.ok("HOME SSH connection established")
+
+    try:
+        step += 1
+        UI.step(step, total_steps, "Uploading HOME chain bootstrap script")
+        sftp = home_client.open_sftp()
+        try:
+            sftp.put(str(REMOTE_SCRIPT_CHAIN_HOME_LOCAL_PATH), home_remote_script_path)
+        finally:
+            sftp.close()
+
+        chmod_cmd = build_privileged_remote_command(home_cfg, f"chmod +x {shlex.quote(home_remote_script_path)}")
+        code, chmod_out = run_capture(home_client, chmod_cmd)
+        if code != 0:
+            raise RuntimeError(f"Failed to chmod HOME chain script:\n{chmod_out}")
+        UI.ok(f"Uploaded to {home_remote_script_path}")
+
+        step += 1
+        UI.step(step, total_steps, "Applying HOME bridge configuration")
+
+        chain_env_map = {
+            "CHAIN_EXIT_HOST": exit_cfg.host,
+            "CHAIN_EXIT_PORT": str(payload.get("port", "")),
+            "CHAIN_EXIT_UUID": str(payload.get("client_id", "")),
+            "CHAIN_EXIT_FLOW": str(payload.get("client_flow", "")),
+            "CHAIN_REALITY_SERVER_NAME": str(payload.get("reality_server_name", "")),
+            "CHAIN_REALITY_PUBLIC_KEY": str(payload.get("reality_public_key", "")),
+            "CHAIN_REALITY_SHORT_ID": str(payload.get("reality_short_id", "")),
+            "CHAIN_XHTTP_MODE": chain_xhttp_mode,
+            "CHAIN_XHTTP_PATH": chain_xhttp_path,
+            "CHAIN_FULL_TUNNEL": env_get(config, "CHAIN_FULL_TUNNEL", "1"),
+            "CHAIN_KEEP_HOME_CLIENT_UUID": env_get(config, "CHAIN_KEEP_HOME_CLIENT_UUID", "1"),
+            "CHAIN_EXIT_REMARK": str(payload.get("remark", "")),
+            "CHAIN_EXIT_CLIENT_EMAIL": str(payload.get("client_email", "")),
+            "CHAIN_EXIT_REALITY_DEST": str(payload.get("reality_dest", "")),
+        }
+
+        chain_exports = env_exports_from_mapping(chain_env_map)
+        command = f"{chain_exports} bash {shlex.quote(home_remote_script_path)}" if chain_exports else f"bash {shlex.quote(home_remote_script_path)}"
+        remote_cmd = build_privileged_remote_command(home_cfg, command)
+
+        code, output = run_streaming(home_client, remote_cmd)
+        if code != 0:
+            UI.err(f"HOME chain provisioning failed with exit code: {code}")
+            return code
+
+        UI.ok("HOME chain provisioning completed")
+
+        step += 1
+        UI.step(step, total_steps, "Downloading HOME artifacts")
+        local_summary = download_summary_if_any(home_client, output, home_cfg.host, artifacts_dir)
+        if local_summary:
+            UI.ok(f"Summary downloaded to: {local_summary}")
+        else:
+            UI.warn("Summary path not detected in output")
+
+        step += 1
+        UI.step(step, total_steps, "Final chain sanity")
+        UI.ok(
+            "Chain mode completed: Home inbound routed via EXIT x-ui inbound "
+            f"{payload.get('remark')} on port {payload.get('port')}"
+        )
+
+        UI.header("Done")
+        UI.ok("Home -> NL chain deployment finished successfully")
+        return 0
+    finally:
+        home_client.close()
+
+
+def main() -> int:
+    UI.header("Nebula Gateway OneClick")
+
+    UI.step(1, 3, "Loading config")
+    env_path = Path(os.environ.get("ENV_FILE", str(DEFAULT_ENV_PATH))).resolve()
+    config = parse_dotenv(env_path)
+    ensure_interactive_config(config, env_path)
+    mode = normalize_deploy_mode(env_get(config, "DEPLOY_MODE", MODE_SINGLE))
+    config["DEPLOY_MODE"] = mode
+    UI.ok(f"Using config file: {env_path}")
+    UI.ok(f"Deploy mode: {mode}")
+
+    UI.step(2, 3, "Checking local dependencies")
+    auto_install = as_bool(env_get(config, "AUTO_INSTALL_PARAMIKO", "1"), default=True)
+    paramiko = ensure_paramiko(auto_install)
+    UI.ok("paramiko is ready")
+
+    UI.step(3, 3, "Running deployment workflow")
+    if mode == MODE_SINGLE:
+        return run_single_mode(config, paramiko)
+    return run_chain_mode(config, paramiko)
 
 
 if __name__ == "__main__":
