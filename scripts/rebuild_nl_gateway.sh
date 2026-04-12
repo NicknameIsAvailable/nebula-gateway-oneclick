@@ -642,6 +642,7 @@ build_naive_singbox_profile_json() {
           username: $username,
           password: $password,
           tls: {
+            enabled: true,
             server_name: $server
           }
         },
