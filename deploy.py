@@ -68,11 +68,18 @@ ENV_KEYS_FOR_SAVE = [
     "CHAIN_HOME_REMOTE_SCRIPT_PATH",
     "LOCAL_ARTIFACTS_DIR",
     # Single-mode gateway settings
+    "SINGLE_TRANSPORT",
     "VLESS_UUID",
     "REALITY_SNI",
     "REALITY_DEST",
     "REALITY_PRIVATE_KEY",
     "REALITY_SHORT_ID",
+    "NAIVE_DOMAIN",
+    "NAIVE_PORT",
+    "NAIVE_USER",
+    "NAIVE_PASS",
+    "NAIVE_EMAIL",
+    "NAIVE_UPSTREAM",
     "HY2_SNI",
     "HY2_PASSWORD",
     "MTPROXY_TLS_DOMAIN",
@@ -232,6 +239,15 @@ def normalize_deploy_mode(value: str) -> str:
     return candidate
 
 
+def normalize_single_transport(value: str) -> str:
+    candidate = (value or "vless").strip().lower()
+    if candidate in {"naive", "naiveproxy"}:
+        return "naiveproxy"
+    if candidate == "vless":
+        return candidate
+    raise ValueError("SINGLE_TRANSPORT must be 'vless' or 'naiveproxy'")
+
+
 def role_key(role: str, key: str) -> str:
     return f"{role}_{key}"
 
@@ -299,6 +315,16 @@ def ensure_interactive_config(config: Dict[str, str], env_path: Path):
     set_default("LOCAL_ARTIFACTS_DIR", "./artifacts")
 
     if mode == MODE_SINGLE:
+        if interactive and not env_get(config, "SINGLE_TRANSPORT"):
+            prompted = True
+            config["SINGLE_TRANSPORT"] = normalize_single_transport(
+                prompt_text("SINGLE_TRANSPORT (vless/naiveproxy)", default="vless")
+            )
+        else:
+            config["SINGLE_TRANSPORT"] = normalize_single_transport(
+                env_get(config, "SINGLE_TRANSPORT", "vless")
+            )
+
         need("SSH_HOST")
         need("SSH_PORT", default="22")
         need("SSH_USER", default="root")
@@ -323,6 +349,8 @@ def ensure_interactive_config(config: Dict[str, str], env_path: Path):
                 config["SUDO_PASSWORD"] = prompt_text("SUDO_PASSWORD (optional)", secret=True, allow_empty=True)
 
         set_default("REMOTE_SCRIPT_PATH", DEFAULT_REMOTE_SCRIPT_SINGLE_PATH)
+        set_default("NAIVE_PORT", "8443")
+        set_default("NAIVE_UPSTREAM", "https://www.cloudflare.com")
 
     else:
         # Seed HOME_* from legacy single-mode keys for convenience.
@@ -563,11 +591,18 @@ def run_capture(client, command: str) -> Tuple[int, str]:
 
 def remote_env_exports(config: Dict[str, str]) -> str:
     keys = [
+        "SINGLE_TRANSPORT",
         "VLESS_UUID",
         "REALITY_SNI",
         "REALITY_DEST",
         "REALITY_PRIVATE_KEY",
         "REALITY_SHORT_ID",
+        "NAIVE_DOMAIN",
+        "NAIVE_PORT",
+        "NAIVE_USER",
+        "NAIVE_PASS",
+        "NAIVE_EMAIL",
+        "NAIVE_UPSTREAM",
         "HY2_SNI",
         "HY2_PASSWORD",
         "MTPROXY_TLS_DOMAIN",
@@ -909,6 +944,7 @@ def run_single_mode(config: Dict[str, str], paramiko) -> int:
     remote_script_path = env_get(config, "REMOTE_SCRIPT_PATH", DEFAULT_REMOTE_SCRIPT_SINGLE_PATH)
     artifacts_dir = Path(env_get(config, "LOCAL_ARTIFACTS_DIR", str(SCRIPT_DIR / "artifacts"))).resolve()
     UI.ok(f"Target: {ssh_cfg.user}@{ssh_cfg.host}:{ssh_cfg.port}")
+    UI.ok(f"Single transport: {normalize_single_transport(env_get(config, 'SINGLE_TRANSPORT', 'vless'))}")
 
     step += 1
     UI.step(step, total_steps, "Connecting to server")

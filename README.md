@@ -3,13 +3,15 @@
 One-click оркестратор развёртывания VPN/anti-censorship стека по SSH.
 
 Поддерживаются два режима:
-- `single` — классический деплой одного NL gateway (Xray + Hysteria2 + MTProxy)
+- `single` — классический деплой одного NL gateway (выбор primary транспорта: `vless` или `naiveproxy`) + Hysteria2 + MTProxy
 - `chain` — цепочка `Home -> NL` на VLESS (Home как bridge, NL как exit через x-ui inbound `xhttp+packet-up`)
 
 ## Что поднимает проект
 
 ### `single` mode
-- `Xray VLESS + Reality` на `TCP 443`
+- primary transport (выбирается через `SINGLE_TRANSPORT`):
+  - `vless`: `Xray VLESS + Reality` на `TCP 443`
+  - `naiveproxy`: `Caddy forwardproxy (naive)` на `TCP 8443` (+ `TCP 80` для ACME)
 - `Hysteria2` на `UDP 443`
 - `MTProxy (FakeTLS)` на `TCP 7443`
 - опционально `Happ/Voxi-compatible subscription feed`
@@ -69,8 +71,13 @@ python deploy.py
 ### `single` mode (legacy)
 - SSH: `SSH_HOST`, `SSH_USER`, `SSH_PASSWORD|SSH_PRIVATE_KEY`
 - опционально: `SUDO_PASSWORD`, `REMOTE_SCRIPT_PATH`
-- транспортные параметры и DR-переменные:
+- выбор primary транспорта:
+  - `SINGLE_TRANSPORT=vless|naiveproxy`
+- параметры для `vless`:
   - `VLESS_UUID`, `REALITY_*`, `HY2_*`, `MTPROXY_*`
+- параметры для `naiveproxy`:
+  - `NAIVE_DOMAIN`, `NAIVE_PORT`, `NAIVE_USER`, `NAIVE_PASS`, `NAIVE_EMAIL`, `NAIVE_UPSTREAM`
+  - если `NAIVE_DOMAIN` пуст, скрипт сгенерирует случайный `*.sslip.io`
 - optional подписка: `HAPP_*`
 - optional backup hooks: `SKIP_PREFLIGHT_BACKUP`, `RESTIC_*`, `BORG_*`
 
@@ -95,7 +102,7 @@ python deploy.py
 ### `single`
 1. Читает `.env`, валидирует SSH.
 2. Загружает `scripts/rebuild_nl_gateway.sh` на target.
-3. Пробрасывает single-переменные в окружение удалённого скрипта.
+3. Пробрасывает single-переменные в окружение удалённого скрипта (включая `SINGLE_TRANSPORT`).
 4. Запускает provisioning под `root/sudo`.
 5. Скачивает summary.
 
