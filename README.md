@@ -3,13 +3,15 @@
 One-click оркестратор развёртывания VPN/anti-censorship стека по SSH.
 
 Поддерживаются два режима:
-- `single` — классический деплой одного NL gateway (Xray + Hysteria2 + MTProxy)
+- `single` — классический деплой одного NL gateway (выбор primary транспорта: `vless` или `naiveproxy`) + Hysteria2 + MTProxy
 - `chain` — цепочка `Home -> NL` на VLESS (Home как bridge, NL как exit через x-ui inbound `xhttp+packet-up`)
 
 ## Что поднимает проект
 
 ### `single` mode
-- `Xray VLESS + Reality` на `TCP 443`
+- primary transport (выбирается через `SINGLE_TRANSPORT`):
+  - `vless`: `Xray VLESS + Reality` на `TCP 443`
+  - `naiveproxy`: `Caddy forwardproxy (naive)` на `TCP 8443` (+ `TCP 80` для ACME)
 - `Hysteria2` на `UDP 443`
 - `MTProxy (FakeTLS)` на `TCP 7443`
 - опционально `Happ/Voxi-compatible subscription feed`
@@ -37,7 +39,9 @@ One-click оркестратор развёртывания VPN/anti-censorship 
 
 - Локально: Python 3.9+
 - На серверах: Linux + `systemd` + SSH доступ
-- Для `single` нужны открытые порты на NL VPS: `443/TCP`, `443/UDP`, `7443/TCP`
+- Для `single`:
+  - при `SINGLE_TRANSPORT=vless`: `443/TCP`, `443/UDP`, `7443/TCP`
+  - при `SINGLE_TRANSPORT=naiveproxy`: `80/TCP`, `8443/TCP`, `443/UDP`, `7443/TCP`
 - Для `chain`:
   - HOME должен быть доступен извне по клиентскому порту (обычно `443/TCP`),
   - на EXIT в x-ui должен существовать отдельный inbound с `network=xhttp`, `xhttpSettings.mode=packet-up` и отдельным портом (не `443`),
@@ -53,7 +57,8 @@ One-click оркестратор развёртывания VPN/anti-censorship 
 python deploy.py
 ```
 
-Если обязательных полей не хватает и есть TTY, `deploy.py` спросит их интерактивно.
+Если обязательных полей не хватает и есть TTY, `deploy.py` спросит их интерактивно.  
+В `single` режиме перед выполнением также делается probe существующих компонентов на сервере; для уже настроенных шагов можно выбрать: прогнать заново или оставить как есть.
 
 После выполнения:
 - лог идёт в консоль,
@@ -65,12 +70,24 @@ python deploy.py
 - `DEPLOY_MODE=single|chain`
 - `AUTO_INSTALL_PARAMIKO=1`
 - `LOCAL_ARTIFACTS_DIR=./artifacts`
+- `EXISTING_COMPONENT_POLICY=ask|rerun|keep`
 
 ### `single` mode (legacy)
 - SSH: `SSH_HOST`, `SSH_USER`, `SSH_PASSWORD|SSH_PRIVATE_KEY`
 - опционально: `SUDO_PASSWORD`, `REMOTE_SCRIPT_PATH`
-- транспортные параметры и DR-переменные:
+- выбор primary транспорта:
+  - `SINGLE_TRANSPORT=vless|naiveproxy`
+- политика для уже существующих шагов:
+  - `EXISTING_COMPONENT_POLICY=ask` (по умолчанию, с вопросами в TTY)
+  - `EXISTING_COMPONENT_POLICY=rerun` (всё прогонять заново)
+  - `EXISTING_COMPONENT_POLICY=keep` (оставлять найденные шаги как есть)
+- точечные override-флаги (0=keep, 1=rerun):
+  - `RECONFIGURE_XRAY`, `RECONFIGURE_NAIVE`, `RECONFIGURE_HYSTERIA`, `RECONFIGURE_MTPROXY`, `RECONFIGURE_HAPP_FEED`
+- параметры для `vless`:
   - `VLESS_UUID`, `REALITY_*`, `HY2_*`, `MTPROXY_*`
+- параметры для `naiveproxy`:
+  - `NAIVE_DOMAIN`, `NAIVE_PORT`, `NAIVE_USER`, `NAIVE_PASS`, `NAIVE_EMAIL`, `NAIVE_UPSTREAM`
+  - если `NAIVE_DOMAIN` пуст, скрипт сгенерирует случайный `*.sslip.io`
 - optional подписка: `HAPP_*`
 - optional backup hooks: `SKIP_PREFLIGHT_BACKUP`, `RESTIC_*`, `BORG_*`
 
@@ -94,10 +111,12 @@ python deploy.py
 
 ### `single`
 1. Читает `.env`, валидирует SSH.
-2. Загружает `scripts/rebuild_nl_gateway.sh` на target.
-3. Пробрасывает single-переменные в окружение удалённого скрипта.
-4. Запускает provisioning под `root/sudo`.
-5. Скачивает summary.
+2. Подключается к target и делает probe уже настроенных компонентов.
+3. Для найденных компонентов применяет политику (`ask|rerun|keep`) и формирует `RECONFIGURE_*`.
+4. Загружает `scripts/rebuild_nl_gateway.sh` на target.
+5. Пробрасывает single-переменные в окружение удалённого скрипта (включая `SINGLE_TRANSPORT` и `RECONFIGURE_*`).
+6. Запускает provisioning под `root/sudo`.
+7. Скачивает summary.
 
 ### `chain`
 1. Читает `.env`, валидирует SSH для `HOME` и `EXIT`.

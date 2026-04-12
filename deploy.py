@@ -67,12 +67,25 @@ ENV_KEYS_FOR_SAVE = [
     "REMOTE_SCRIPT_PATH",
     "CHAIN_HOME_REMOTE_SCRIPT_PATH",
     "LOCAL_ARTIFACTS_DIR",
+    "EXISTING_COMPONENT_POLICY",
     # Single-mode gateway settings
+    "SINGLE_TRANSPORT",
+    "RECONFIGURE_XRAY",
+    "RECONFIGURE_NAIVE",
+    "RECONFIGURE_HYSTERIA",
+    "RECONFIGURE_MTPROXY",
+    "RECONFIGURE_HAPP_FEED",
     "VLESS_UUID",
     "REALITY_SNI",
     "REALITY_DEST",
     "REALITY_PRIVATE_KEY",
     "REALITY_SHORT_ID",
+    "NAIVE_DOMAIN",
+    "NAIVE_PORT",
+    "NAIVE_USER",
+    "NAIVE_PASS",
+    "NAIVE_EMAIL",
+    "NAIVE_UPSTREAM",
     "HY2_SNI",
     "HY2_PASSWORD",
     "MTPROXY_TLS_DOMAIN",
@@ -232,6 +245,15 @@ def normalize_deploy_mode(value: str) -> str:
     return candidate
 
 
+def normalize_single_transport(value: str) -> str:
+    candidate = (value or "vless").strip().lower()
+    if candidate in {"naive", "naiveproxy"}:
+        return "naiveproxy"
+    if candidate == "vless":
+        return candidate
+    raise ValueError("SINGLE_TRANSPORT must be 'vless' or 'naiveproxy'")
+
+
 def role_key(role: str, key: str) -> str:
     return f"{role}_{key}"
 
@@ -297,8 +319,19 @@ def ensure_interactive_config(config: Dict[str, str], env_path: Path):
 
     set_default("AUTO_INSTALL_PARAMIKO", "1")
     set_default("LOCAL_ARTIFACTS_DIR", "./artifacts")
+    set_default("EXISTING_COMPONENT_POLICY", "ask")
 
     if mode == MODE_SINGLE:
+        if interactive and not env_get(config, "SINGLE_TRANSPORT"):
+            prompted = True
+            config["SINGLE_TRANSPORT"] = normalize_single_transport(
+                prompt_text("SINGLE_TRANSPORT (vless/naiveproxy)", default="vless")
+            )
+        else:
+            config["SINGLE_TRANSPORT"] = normalize_single_transport(
+                env_get(config, "SINGLE_TRANSPORT", "vless")
+            )
+
         need("SSH_HOST")
         need("SSH_PORT", default="22")
         need("SSH_USER", default="root")
@@ -323,6 +356,8 @@ def ensure_interactive_config(config: Dict[str, str], env_path: Path):
                 config["SUDO_PASSWORD"] = prompt_text("SUDO_PASSWORD (optional)", secret=True, allow_empty=True)
 
         set_default("REMOTE_SCRIPT_PATH", DEFAULT_REMOTE_SCRIPT_SINGLE_PATH)
+        set_default("NAIVE_PORT", "8443")
+        set_default("NAIVE_UPSTREAM", "https://www.cloudflare.com")
 
     else:
         # Seed HOME_* from legacy single-mode keys for convenience.
@@ -563,11 +598,18 @@ def run_capture(client, command: str) -> Tuple[int, str]:
 
 def remote_env_exports(config: Dict[str, str]) -> str:
     keys = [
+        "SINGLE_TRANSPORT",
         "VLESS_UUID",
         "REALITY_SNI",
         "REALITY_DEST",
         "REALITY_PRIVATE_KEY",
         "REALITY_SHORT_ID",
+        "NAIVE_DOMAIN",
+        "NAIVE_PORT",
+        "NAIVE_USER",
+        "NAIVE_PASS",
+        "NAIVE_EMAIL",
+        "NAIVE_UPSTREAM",
         "HY2_SNI",
         "HY2_PASSWORD",
         "MTPROXY_TLS_DOMAIN",
@@ -895,8 +937,178 @@ def parse_probe_payload(output: str) -> Dict[str, Any]:
     raise ValueError("Unable to parse probe JSON output")
 
 
+def normalize_existing_component_policy(value: str) -> str:
+    candidate = (value or "ask").strip().lower()
+    if candidate not in {"ask", "rerun", "keep"}:
+        raise ValueError("EXISTING_COMPONENT_POLICY must be 'ask', 'rerun', or 'keep'")
+    return candidate
+
+
+def build_single_existing_probe_command() -> str:
+    python_code = textwrap.dedent(
+        """
+        import json
+        import pathlib
+        import shutil
+
+        def service_unit_exists(name: str) -> bool:
+            candidates = [
+                f"/etc/systemd/system/{name}.service",
+                f"/lib/systemd/system/{name}.service",
+                f"/usr/lib/systemd/system/{name}.service",
+            ]
+            return any(pathlib.Path(p).exists() for p in candidates)
+
+        payload = {
+            "ok": True,
+            "xray": {
+                "binary_exists": bool(shutil.which("xray") or pathlib.Path("/usr/local/bin/xray").exists()),
+                "config_exists": pathlib.Path("/usr/local/etc/xray/config.json").exists(),
+                "service_unit_exists": service_unit_exists("xray"),
+            },
+            "naiveproxy": {
+                "binary_exists": bool(shutil.which("caddy-naive") or pathlib.Path("/usr/local/bin/caddy-naive").exists()),
+                "config_exists": pathlib.Path("/etc/caddy/Caddyfile-naive").exists(),
+                "service_unit_exists": service_unit_exists("naiveproxy-caddy"),
+            },
+            "hysteria": {
+                "config_exists": pathlib.Path("/etc/hysteria/config.yaml").exists(),
+                "service_unit_exists": service_unit_exists("hysteria-server"),
+            },
+            "mtproxy": {
+                "repo_exists": pathlib.Path("/opt/MTProxy/.git").exists(),
+                "service_unit_exists": service_unit_exists("mtproxy"),
+            },
+            "happ_feed": {
+                "data_dir_exists": pathlib.Path("/opt/nebula-subscription").exists(),
+                "service_unit_exists": service_unit_exists("nebula-subscription"),
+            },
+        }
+
+        payload["xray"]["configured"] = bool(payload["xray"]["config_exists"] or payload["xray"]["service_unit_exists"])
+        payload["naiveproxy"]["configured"] = bool(
+            payload["naiveproxy"]["config_exists"] or payload["naiveproxy"]["service_unit_exists"]
+        )
+        payload["hysteria"]["configured"] = bool(
+            payload["hysteria"]["config_exists"] or payload["hysteria"]["service_unit_exists"]
+        )
+        payload["mtproxy"]["configured"] = bool(
+            payload["mtproxy"]["repo_exists"] or payload["mtproxy"]["service_unit_exists"]
+        )
+        payload["happ_feed"]["configured"] = bool(
+            payload["happ_feed"]["data_dir_exists"] or payload["happ_feed"]["service_unit_exists"]
+        )
+
+        print(json.dumps(payload, ensure_ascii=False))
+        """
+    ).strip()
+
+    return f"python3 - <<'PY'\n{python_code}\nPY"
+
+
+def _probe_component_configured(payload: Dict[str, Any], key: str) -> bool:
+    component = payload.get(key, {})
+    if not isinstance(component, dict):
+        return False
+    return bool(component.get("configured"))
+
+
+def _choose_reconfigure_value(
+    *,
+    config: Dict[str, str],
+    key: str,
+    label: str,
+    exists: bool,
+    policy: str,
+    interactive: bool,
+) -> str:
+    explicit = env_get(config, key)
+    if explicit:
+        return "1" if as_bool(explicit, default=True) else "0"
+
+    if not exists:
+        return "1"
+
+    if policy == "rerun":
+        return "1"
+    if policy == "keep":
+        return "0"
+
+    if not interactive:
+        UI.warn(f"{label}: existing config detected but no interactive TTY; defaulting to rerun")
+        return "1"
+
+    answer = prompt_text(
+        f"{label} already configured on server. Re-run this step from scratch? (y/N)",
+        default="n",
+        allow_empty=True,
+    ).strip().lower()
+    return "1" if answer in {"y", "yes"} else "0"
+
+
+def build_single_reconfigure_mapping(config: Dict[str, str], probe_payload: Dict[str, Any]) -> Dict[str, str]:
+    policy = normalize_existing_component_policy(env_get(config, "EXISTING_COMPONENT_POLICY", "ask"))
+    interactive = sys.stdin.isatty()
+    transport = normalize_single_transport(env_get(config, "SINGLE_TRANSPORT", "vless"))
+    happ_enabled = as_bool(env_get(config, "HAPP_COMPAT_MODE", "0"), default=False)
+
+    mapping: Dict[str, str] = {}
+
+    if transport == "vless":
+        mapping["RECONFIGURE_XRAY"] = _choose_reconfigure_value(
+            config=config,
+            key="RECONFIGURE_XRAY",
+            label="Xray (VLESS+Reality)",
+            exists=_probe_component_configured(probe_payload, "xray"),
+            policy=policy,
+            interactive=interactive,
+        )
+        mapping["RECONFIGURE_NAIVE"] = "0"
+    else:
+        mapping["RECONFIGURE_NAIVE"] = _choose_reconfigure_value(
+            config=config,
+            key="RECONFIGURE_NAIVE",
+            label="NaiveProxy (caddy-forwardproxy)",
+            exists=_probe_component_configured(probe_payload, "naiveproxy"),
+            policy=policy,
+            interactive=interactive,
+        )
+        mapping["RECONFIGURE_XRAY"] = "0"
+
+    mapping["RECONFIGURE_HYSTERIA"] = _choose_reconfigure_value(
+        config=config,
+        key="RECONFIGURE_HYSTERIA",
+        label="Hysteria2",
+        exists=_probe_component_configured(probe_payload, "hysteria"),
+        policy=policy,
+        interactive=interactive,
+    )
+    mapping["RECONFIGURE_MTPROXY"] = _choose_reconfigure_value(
+        config=config,
+        key="RECONFIGURE_MTPROXY",
+        label="MTProxy",
+        exists=_probe_component_configured(probe_payload, "mtproxy"),
+        policy=policy,
+        interactive=interactive,
+    )
+
+    if happ_enabled:
+        mapping["RECONFIGURE_HAPP_FEED"] = _choose_reconfigure_value(
+            config=config,
+            key="RECONFIGURE_HAPP_FEED",
+            label="Happ-compatible feed",
+            exists=_probe_component_configured(probe_payload, "happ_feed"),
+            policy=policy,
+            interactive=interactive,
+        )
+    else:
+        mapping["RECONFIGURE_HAPP_FEED"] = "0"
+
+    return mapping
+
+
 def run_single_mode(config: Dict[str, str], paramiko) -> int:
-    total_steps = 5
+    total_steps = 6
     step = 0
 
     step += 1
@@ -909,6 +1121,7 @@ def run_single_mode(config: Dict[str, str], paramiko) -> int:
     remote_script_path = env_get(config, "REMOTE_SCRIPT_PATH", DEFAULT_REMOTE_SCRIPT_SINGLE_PATH)
     artifacts_dir = Path(env_get(config, "LOCAL_ARTIFACTS_DIR", str(SCRIPT_DIR / "artifacts"))).resolve()
     UI.ok(f"Target: {ssh_cfg.user}@{ssh_cfg.host}:{ssh_cfg.port}")
+    UI.ok(f"Single transport: {normalize_single_transport(env_get(config, 'SINGLE_TRANSPORT', 'vless'))}")
 
     step += 1
     UI.step(step, total_steps, "Connecting to server")
@@ -916,6 +1129,45 @@ def run_single_mode(config: Dict[str, str], paramiko) -> int:
     UI.ok("SSH connection established")
 
     try:
+        step += 1
+        UI.step(step, total_steps, "Inspecting existing server components")
+        probe_cmd = build_privileged_remote_command(ssh_cfg, build_single_existing_probe_command())
+        code, probe_output = run_capture(client, probe_cmd)
+        probe_payload: Dict[str, Any] = {}
+        if code == 0:
+            try:
+                probe_payload = parse_probe_payload(probe_output)
+            except Exception:
+                probe_payload = {
+                    "ok": False,
+                    "error": "single_probe_parse_failed",
+                    "raw_output": probe_output.strip()[-4000:],
+                }
+        else:
+            probe_payload = {
+                "ok": False,
+                "error": "single_probe_failed",
+                "raw_output": probe_output.strip()[-4000:],
+            }
+
+        if not probe_payload.get("ok"):
+            UI.warn("Existing-state probe failed; defaulting to re-run behavior")
+        else:
+            xray_state = "yes" if _probe_component_configured(probe_payload, "xray") else "no"
+            naive_state = "yes" if _probe_component_configured(probe_payload, "naiveproxy") else "no"
+            hy_state = "yes" if _probe_component_configured(probe_payload, "hysteria") else "no"
+            mt_state = "yes" if _probe_component_configured(probe_payload, "mtproxy") else "no"
+            happ_state = "yes" if _probe_component_configured(probe_payload, "happ_feed") else "no"
+            UI.info(
+                "Existing components detected: "
+                f"xray={xray_state}, naiveproxy={naive_state}, hysteria={hy_state}, mtproxy={mt_state}, happ_feed={happ_state}"
+            )
+
+        reconfigure_mapping = build_single_reconfigure_mapping(config, probe_payload)
+        for key, value in reconfigure_mapping.items():
+            action = "rerun" if value == "1" else "keep"
+            UI.info(f"{key}={value} ({action})")
+
         step += 1
         UI.step(step, total_steps, "Uploading bootstrap script")
         sftp = client.open_sftp()
@@ -933,7 +1185,9 @@ def run_single_mode(config: Dict[str, str], paramiko) -> int:
         step += 1
         UI.step(step, total_steps, "Executing remote provisioning")
         exports = remote_env_exports(config)
-        command = f"{exports} bash {shlex.quote(remote_script_path)}" if exports else f"bash {shlex.quote(remote_script_path)}"
+        reconfigure_exports = env_exports_from_mapping(reconfigure_mapping)
+        env_prefix = " ".join(part for part in (exports, reconfigure_exports) if part)
+        command = f"{env_prefix} bash {shlex.quote(remote_script_path)}" if env_prefix else f"bash {shlex.quote(remote_script_path)}"
         remote_cmd = build_privileged_remote_command(ssh_cfg, command)
 
         code, output = run_streaming(client, remote_cmd)
