@@ -19,6 +19,8 @@ set -euo pipefail
 #   NAIVE_EMAIL=... NAIVE_UPSTREAM=https://www.cloudflare.com
 #   HY2_SNI=www.microsoft.com HY2_PASSWORD=...
 #   MTPROXY_TLS_DOMAIN=www.cloudflare.com MTPROXY_SECRET=...
+#   RECONFIGURE_XRAY=1 RECONFIGURE_NAIVE=1 RECONFIGURE_HYSTERIA=1 RECONFIGURE_MTPROXY=1
+#   RECONFIGURE_HAPP_FEED=1
 #
 # Optional preflight backup environment:
 #   SKIP_PREFLIGHT_BACKUP=1
@@ -115,6 +117,11 @@ HAPP_PUSH_URL="${HAPP_PUSH_URL:-}"
 HAPP_PUSH_AUTH_HEADER="${HAPP_PUSH_AUTH_HEADER:-}"
 
 SKIP_PREFLIGHT_BACKUP="${SKIP_PREFLIGHT_BACKUP:-0}"
+RECONFIGURE_XRAY="${RECONFIGURE_XRAY:-1}"
+RECONFIGURE_NAIVE="${RECONFIGURE_NAIVE:-1}"
+RECONFIGURE_HYSTERIA="${RECONFIGURE_HYSTERIA:-1}"
+RECONFIGURE_MTPROXY="${RECONFIGURE_MTPROXY:-1}"
+RECONFIGURE_HAPP_FEED="${RECONFIGURE_HAPP_FEED:-1}"
 
 HAPP_COMPAT_ENABLED=0
 if is_enabled "${HAPP_COMPAT_MODE}"; then
@@ -280,6 +287,170 @@ extract_reality_public_key() {
   echo "$1" | awk -F': ' '/Public key|PublicKey|Password \(PublicKey\)/ {print $2; exit}'
 }
 
+load_existing_vless_state() {
+  local cfg="/usr/local/etc/xray/config.json"
+  XRAY_BIN="$(command -v xray || true)"
+  if [[ -z "${XRAY_BIN}" ]]; then
+    XRAY_BIN="/usr/local/bin/xray"
+  fi
+  if [[ ! -x "${XRAY_BIN}" ]]; then
+    log_err "Cannot reuse existing Xray state: xray binary not found"
+    exit 1
+  fi
+  if [[ ! -f "${cfg}" ]]; then
+    log_err "Cannot reuse existing Xray state: ${cfg} not found"
+    exit 1
+  fi
+
+  VLESS_UUID="$(jq -r '.inbounds[] | select(.protocol=="vless") | .settings.clients[0].id // empty' "${cfg}" | head -n1)"
+  REALITY_SNI="$(jq -r '.inbounds[] | select(.protocol=="vless") | .streamSettings.realitySettings.serverNames[0] // empty' "${cfg}" | head -n1)"
+  REALITY_DEST="$(jq -r '.inbounds[] | select(.protocol=="vless") | .streamSettings.realitySettings.dest // empty' "${cfg}" | head -n1)"
+  REALITY_SHORT_ID="$(jq -r '.inbounds[] | select(.protocol=="vless") | .streamSettings.realitySettings.shortIds[0] // empty' "${cfg}" | head -n1)"
+  REALITY_PRIV="$(jq -r '.inbounds[] | select(.protocol=="vless") | .streamSettings.realitySettings.privateKey // empty' "${cfg}" | head -n1)"
+
+  if [[ -z "${VLESS_UUID}" || -z "${REALITY_SNI}" || -z "${REALITY_DEST}" || -z "${REALITY_SHORT_ID}" || -z "${REALITY_PRIV}" ]]; then
+    log_err "Cannot parse required VLESS/Reality fields from existing Xray config"
+    exit 1
+  fi
+
+  XRAY_KEYS="$("${XRAY_BIN}" x25519 -i "${REALITY_PRIV}")"
+  REALITY_PUB="$(extract_reality_public_key "${XRAY_KEYS}")"
+  if [[ -z "${REALITY_PUB}" ]]; then
+    log_err "Cannot derive Reality public key from existing private key"
+    exit 1
+  fi
+
+  systemctl enable xray >/dev/null 2>&1 || true
+  systemctl restart xray
+  systemctl is-active --quiet xray
+}
+
+load_existing_naive_state() {
+  local cfg="/etc/caddy/Caddyfile-naive"
+  if [[ ! -f "${cfg}" ]]; then
+    log_err "Cannot reuse existing NaiveProxy state: ${cfg} not found"
+    exit 1
+  fi
+  if [[ ! -x /usr/local/bin/caddy-naive ]]; then
+    log_err "Cannot reuse existing NaiveProxy state: /usr/local/bin/caddy-naive not found"
+    exit 1
+  fi
+
+  local bind_line=""
+  bind_line="$(grep -E '^[[:space:]]*:[0-9]+,[[:space:]]*[^[:space:]]+:[0-9]+' "${cfg}" | head -n1 || true)"
+  if [[ -n "${bind_line}" ]]; then
+    local parsed_port parsed_domain
+    parsed_port="$(echo "${bind_line}" | sed -nE 's/^[[:space:]]*:([0-9]+).*/\1/p')"
+    parsed_domain="$(echo "${bind_line}" | sed -nE 's/^[[:space:]]*:[0-9]+,[[:space:]]*([^:[:space:]\{]+):[0-9]+.*/\1/p')"
+    if [[ -n "${parsed_port}" ]]; then
+      NAIVE_PORT="${parsed_port}"
+    fi
+    if [[ -n "${parsed_domain}" ]]; then
+      NAIVE_DOMAIN="${parsed_domain}"
+    fi
+  fi
+
+  local parsed_user parsed_pass parsed_email
+  parsed_user="$(awk '/basic_auth[[:space:]]+/ {print $2; exit}' "${cfg}")"
+  parsed_pass="$(awk '/basic_auth[[:space:]]+/ {print $3; exit}' "${cfg}")"
+  parsed_email="$(awk '/^[[:space:]]*email[[:space:]]+/ {print $2; exit}' "${cfg}")"
+
+  if [[ -n "${parsed_user}" ]]; then
+    NAIVE_USER="${parsed_user}"
+  fi
+  if [[ -n "${parsed_pass}" ]]; then
+    NAIVE_PASS="${parsed_pass}"
+  fi
+  if [[ -n "${parsed_email}" ]]; then
+    NAIVE_EMAIL="${parsed_email}"
+  fi
+  if [[ -z "${NAIVE_EMAIL}" && -n "${NAIVE_DOMAIN}" ]]; then
+    NAIVE_EMAIL="admin@${NAIVE_DOMAIN}"
+  fi
+
+  if [[ -z "${NAIVE_DOMAIN}" || -z "${NAIVE_PORT}" || -z "${NAIVE_USER}" || -z "${NAIVE_PASS}" ]]; then
+    log_err "Cannot parse required NaiveProxy fields from existing Caddy config"
+    exit 1
+  fi
+
+  NAIVE_PROXY_URL="https://${NAIVE_USER}:${NAIVE_PASS}@${NAIVE_DOMAIN}:${NAIVE_PORT}"
+  systemctl daemon-reload
+  systemctl enable naiveproxy-caddy >/dev/null 2>&1 || true
+  systemctl restart naiveproxy-caddy
+  systemctl is-active --quiet naiveproxy-caddy
+}
+
+load_existing_hysteria_state() {
+  local cfg="/etc/hysteria/config.yaml"
+  if [[ ! -f "${cfg}" ]]; then
+    log_err "Cannot reuse existing Hysteria2 state: ${cfg} not found"
+    exit 1
+  fi
+
+  local parsed_password parsed_url parsed_sni
+  parsed_password="$(sed -nE 's/^[[:space:]]*password:[[:space:]]*"?([^"]+)"?[[:space:]]*$/\1/p' "${cfg}" | head -n1)"
+  parsed_url="$(sed -nE 's/^[[:space:]]*url:[[:space:]]*"?([^"]+)"?[[:space:]]*$/\1/p' "${cfg}" | head -n1)"
+  parsed_sni="$(echo "${parsed_url}" | sed -nE 's#^https://([^/]+).*$#\1#p')"
+
+  if [[ -n "${parsed_password}" ]]; then
+    HY2_PASSWORD="${parsed_password}"
+  fi
+  if [[ -n "${parsed_sni}" ]]; then
+    HY2_SNI="${parsed_sni}"
+  fi
+  if [[ -z "${HY2_PASSWORD}" ]]; then
+    log_err "Cannot parse Hysteria2 password from existing config"
+    exit 1
+  fi
+
+  systemctl daemon-reload
+  systemctl enable hysteria-server >/dev/null 2>&1 || true
+  systemctl restart hysteria-server
+  systemctl is-active --quiet hysteria-server
+}
+
+load_existing_mtproxy_state() {
+  local unit_file="/etc/systemd/system/mtproxy.service"
+  if [[ ! -f "${unit_file}" ]]; then
+    unit_file="/lib/systemd/system/mtproxy.service"
+  fi
+  if [[ ! -f "${unit_file}" ]]; then
+    unit_file="/usr/lib/systemd/system/mtproxy.service"
+  fi
+  if [[ ! -f "${unit_file}" ]]; then
+    log_err "Cannot reuse existing MTProxy state: mtproxy service file not found"
+    exit 1
+  fi
+
+  local exec_line parsed_domain parsed_secret
+  exec_line="$(grep -E '^ExecStart=' "${unit_file}" | head -n1 || true)"
+  parsed_domain="$(echo "${exec_line}" | sed -nE 's/.* -D[[:space:]]+([^[:space:]]+).*/\1/p')"
+  parsed_secret="$(echo "${exec_line}" | sed -nE 's/.* -S[[:space:]]+([0-9a-fA-F]+).*/\1/p')"
+  if [[ -n "${parsed_domain}" ]]; then
+    MTPROXY_TLS_DOMAIN="${parsed_domain}"
+  fi
+  if [[ -n "${parsed_secret}" ]]; then
+    MTPROXY_SECRET="${parsed_secret}"
+  fi
+  if [[ -z "${MTPROXY_SECRET}" ]]; then
+    log_err "Cannot parse MTProxy secret from existing unit file"
+    exit 1
+  fi
+
+  mkdir -p /opt/MTProxy
+  if [[ ! -f /opt/MTProxy/proxy-secret ]]; then
+    curl -fsSL https://core.telegram.org/getProxySecret -o /opt/MTProxy/proxy-secret
+  fi
+  if [[ ! -f /opt/MTProxy/proxy-multi.conf ]]; then
+    curl -fsSL https://core.telegram.org/getProxyConfig -o /opt/MTProxy/proxy-multi.conf
+  fi
+
+  systemctl daemon-reload
+  systemctl enable mtproxy >/dev/null 2>&1 || true
+  systemctl restart mtproxy
+  systemctl is-active --quiet mtproxy
+}
+
 normalize_happ_settings() {
   if [[ "${HAPP_SUBSCRIPTION_PATH}" != /* ]]; then
     HAPP_SUBSCRIPTION_PATH="/${HAPP_SUBSCRIPTION_PATH}"
@@ -414,6 +585,19 @@ EOF
   fi
 }
 
+load_existing_happ_feed_state() {
+  local host_for_url="${HAPP_PUBLIC_HOST:-${SERVER_IP}}"
+  local raw_rel_path="${HAPP_SUBSCRIPTION_PATH}.txt"
+  local json_rel_path="${HAPP_SUBSCRIPTION_PATH}.json"
+
+  HAPP_SUB_TXT_URL="http://${host_for_url}:${HAPP_SUBSCRIPTION_PORT}${raw_rel_path}"
+  HAPP_SUB_JSON_URL="http://${host_for_url}:${HAPP_SUBSCRIPTION_PORT}${json_rel_path}"
+
+  if systemctl list-unit-files | grep -q '^nebula-subscription\.service'; then
+    systemctl restart nebula-subscription >/dev/null 2>&1 || true
+  fi
+}
+
 detect_server_ip() {
   SERVER_IP="$(curl -4fsSL ifconfig.me || true)"
   if [[ -z "${SERVER_IP}" ]]; then
@@ -525,9 +709,11 @@ log_info "Detected distro: ${OS_PRETTY} (id=${OS_ID}, version=${OS_VERSION})"
 log_info "Package manager: ${PKG_MGR}"
 log_info "Script tested on: Ubuntu 24.04 (other distros are best-effort)"
 log_info "Primary transport: ${SINGLE_TRANSPORT}"
+log_info "Reconfigure flags: xray=${RECONFIGURE_XRAY}, naive=${RECONFIGURE_NAIVE}, hysteria=${RECONFIGURE_HYSTERIA}, mtproxy=${RECONFIGURE_MTPROXY}"
 if [[ "${HAPP_COMPAT_ENABLED}" -eq 1 ]]; then
   normalize_happ_settings
   log_info "Happ-compatible mode: enabled"
+  log_info "Reconfigure Happ feed: ${RECONFIGURE_HAPP_FEED}"
   log_info "Happ feed path: ${HAPP_SUBSCRIPTION_PATH} (port ${HAPP_SUBSCRIPTION_PORT})"
 else
   log_info "Happ-compatible mode: disabled"
@@ -542,34 +728,35 @@ install_base_packages
 log_ok "Base packages installed"
 
 if [[ "${SINGLE_TRANSPORT}" == "vless" ]]; then
-  log_step "Installing Xray"
-  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install -u root
-  XRAY_BIN="$(command -v xray || true)"
-  if [[ -z "${XRAY_BIN}" ]]; then
-    XRAY_BIN="/usr/local/bin/xray"
-  fi
-  log_ok "Xray installed (${XRAY_BIN})"
+  if is_enabled "${RECONFIGURE_XRAY}"; then
+    log_step "Installing Xray"
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install -u root
+    XRAY_BIN="$(command -v xray || true)"
+    if [[ -z "${XRAY_BIN}" ]]; then
+      XRAY_BIN="/usr/local/bin/xray"
+    fi
+    log_ok "Xray installed (${XRAY_BIN})"
 
-  log_step "Generating Reality keys"
-  if [[ -n "${REALITY_PRIVATE_KEY}" ]]; then
-    XRAY_KEYS="$("${XRAY_BIN}" x25519 -i "${REALITY_PRIVATE_KEY}")"
-    REALITY_PRIV="${REALITY_PRIVATE_KEY}"
-    REALITY_PUB="$(extract_reality_public_key "${XRAY_KEYS}")"
-  else
-    XRAY_KEYS="$("${XRAY_BIN}" x25519)"
-    REALITY_PRIV="$(extract_reality_private_key "${XRAY_KEYS}")"
-    REALITY_PUB="$(extract_reality_public_key "${XRAY_KEYS}")"
-  fi
+    log_step "Generating Reality keys"
+    if [[ -n "${REALITY_PRIVATE_KEY}" ]]; then
+      XRAY_KEYS="$("${XRAY_BIN}" x25519 -i "${REALITY_PRIVATE_KEY}")"
+      REALITY_PRIV="${REALITY_PRIVATE_KEY}"
+      REALITY_PUB="$(extract_reality_public_key "${XRAY_KEYS}")"
+    else
+      XRAY_KEYS="$("${XRAY_BIN}" x25519)"
+      REALITY_PRIV="$(extract_reality_private_key "${XRAY_KEYS}")"
+      REALITY_PUB="$(extract_reality_public_key "${XRAY_KEYS}")"
+    fi
 
-  if [[ -z "${REALITY_PRIV}" || -z "${REALITY_PUB}" ]]; then
-    log_err "Failed to parse Reality keys from xray output"
-    exit 1
-  fi
-  log_ok "Reality keys ready"
+    if [[ -z "${REALITY_PRIV}" || -z "${REALITY_PUB}" ]]; then
+      log_err "Failed to parse Reality keys from xray output"
+      exit 1
+    fi
+    log_ok "Reality keys ready"
 
-  log_step "Configuring Xray (VLESS+Reality on TCP 443)"
-  mkdir -p /usr/local/etc/xray
-  cat >/usr/local/etc/xray/config.json <<EOF
+    log_step "Configuring Xray (VLESS+Reality on TCP 443)"
+    mkdir -p /usr/local/etc/xray
+    cat >/usr/local/etc/xray/config.json <<EOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
@@ -615,37 +802,49 @@ if [[ "${SINGLE_TRANSPORT}" == "vless" ]]; then
   }
 }
 EOF
-  chmod 644 /usr/local/etc/xray/config.json
-  systemctl enable xray
-  systemctl restart xray
-  systemctl is-active --quiet xray
-  log_ok "Xray is active"
+    chmod 644 /usr/local/etc/xray/config.json
+    systemctl enable xray
+    systemctl restart xray
+    systemctl is-active --quiet xray
+    log_ok "Xray is active"
+  else
+    log_step "Reusing existing Xray (VLESS+Reality) state"
+    load_existing_vless_state
+    log_ok "Existing Xray state loaded"
+  fi
 else
-  log_step "Installing NaiveProxy toolchain"
-  build_naive_caddy_if_needed
-  log_ok "NaiveProxy toolchain ready"
+  if is_enabled "${RECONFIGURE_NAIVE}"; then
+    log_step "Installing NaiveProxy toolchain"
+    build_naive_caddy_if_needed
+    log_ok "NaiveProxy toolchain ready"
 
-  log_step "Configuring NaiveProxy (TCP ${NAIVE_PORT})"
-  configure_naiveproxy_transport
-  log_ok "NaiveProxy is active"
+    log_step "Configuring NaiveProxy (TCP ${NAIVE_PORT})"
+    configure_naiveproxy_transport
+    log_ok "NaiveProxy is active"
+  else
+    log_step "Reusing existing NaiveProxy state"
+    load_existing_naive_state
+    log_ok "Existing NaiveProxy state loaded"
+  fi
 
   if systemctl list-unit-files | grep -q '^xray\.service'; then
     systemctl disable --now xray >/dev/null 2>&1 || true
   fi
 fi
 
-log_step "Installing Hysteria2"
-bash -c "$(curl -fsSL https://get.hy2.sh/)"
-log_ok "Hysteria2 installed"
+if is_enabled "${RECONFIGURE_HYSTERIA}"; then
+  log_step "Installing Hysteria2"
+  bash -c "$(curl -fsSL https://get.hy2.sh/)"
+  log_ok "Hysteria2 installed"
 
-log_step "Configuring Hysteria2 (UDP 443)"
-mkdir -p /etc/hysteria
-openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
-  -keyout /etc/hysteria/server.key \
-  -out /etc/hysteria/server.crt \
-  -subj "/CN=${HY2_SNI}" >/dev/null 2>&1
+  log_step "Configuring Hysteria2 (UDP 443)"
+  mkdir -p /etc/hysteria
+  openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+    -keyout /etc/hysteria/server.key \
+    -out /etc/hysteria/server.crt \
+    -subj "/CN=${HY2_SNI}" >/dev/null 2>&1
 
-cat >/etc/hysteria/config.yaml <<EOF
+  cat >/etc/hysteria/config.yaml <<EOF
 listen: :443
 
 tls:
@@ -669,30 +868,36 @@ bandwidth:
 ignoreClientBandwidth: false
 EOF
 
-if id hysteria >/dev/null 2>&1; then
-  chown hysteria:hysteria /etc/hysteria/server.key /etc/hysteria/server.crt
-fi
-chmod 640 /etc/hysteria/server.key /etc/hysteria/server.crt
-systemctl daemon-reload
-systemctl enable hysteria-server
-systemctl restart hysteria-server
-systemctl is-active --quiet hysteria-server
-log_ok "Hysteria2 is active"
-
-log_step "Installing MTProxy"
-if [[ ! -d /opt/MTProxy/.git ]]; then
-  rm -rf /opt/MTProxy
-  git clone https://github.com/TelegramMessenger/MTProxy /opt/MTProxy
+  if id hysteria >/dev/null 2>&1; then
+    chown hysteria:hysteria /etc/hysteria/server.key /etc/hysteria/server.crt
+  fi
+  chmod 640 /etc/hysteria/server.key /etc/hysteria/server.crt
+  systemctl daemon-reload
+  systemctl enable hysteria-server
+  systemctl restart hysteria-server
+  systemctl is-active --quiet hysteria-server
+  log_ok "Hysteria2 is active"
 else
-  git -C /opt/MTProxy pull --ff-only
+  log_step "Reusing existing Hysteria2 state"
+  load_existing_hysteria_state
+  log_ok "Existing Hysteria2 state loaded"
 fi
-make -C /opt/MTProxy
-curl -fsSL https://core.telegram.org/getProxySecret -o /opt/MTProxy/proxy-secret
-curl -fsSL https://core.telegram.org/getProxyConfig -o /opt/MTProxy/proxy-multi.conf
-log_ok "MTProxy binaries/config downloaded"
 
-log_step "Configuring MTProxy (FakeTLS on TCP 7443)"
-cat >/etc/systemd/system/mtproxy.service <<EOF
+if is_enabled "${RECONFIGURE_MTPROXY}"; then
+  log_step "Installing MTProxy"
+  if [[ ! -d /opt/MTProxy/.git ]]; then
+    rm -rf /opt/MTProxy
+    git clone https://github.com/TelegramMessenger/MTProxy /opt/MTProxy
+  else
+    git -C /opt/MTProxy pull --ff-only
+  fi
+  make -C /opt/MTProxy
+  curl -fsSL https://core.telegram.org/getProxySecret -o /opt/MTProxy/proxy-secret
+  curl -fsSL https://core.telegram.org/getProxyConfig -o /opt/MTProxy/proxy-multi.conf
+  log_ok "MTProxy binaries/config downloaded"
+
+  log_step "Configuring MTProxy (FakeTLS on TCP 7443)"
+  cat >/etc/systemd/system/mtproxy.service <<EOF
 [Unit]
 Description=MTProto Proxy
 After=network.target
@@ -708,11 +913,16 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable mtproxy
-systemctl restart mtproxy
-systemctl is-active --quiet mtproxy
-log_ok "MTProxy is active"
+  systemctl daemon-reload
+  systemctl enable mtproxy
+  systemctl restart mtproxy
+  systemctl is-active --quiet mtproxy
+  log_ok "MTProxy is active"
+else
+  log_step "Reusing existing MTProxy state"
+  load_existing_mtproxy_state
+  log_ok "Existing MTProxy state loaded"
+fi
 
 log_step "Generating client links and summary"
 detect_server_ip
@@ -742,9 +952,15 @@ MT_DD_URL="https://t.me/proxy?server=${SERVER_IP}&port=7443&secret=dd${MTPROXY_S
 HAPP_SUB_TXT_URL=""
 HAPP_SUB_JSON_URL=""
 if [[ "${HAPP_COMPAT_ENABLED}" -eq 1 ]]; then
-  log_step "Configuring Happ-compatible subscription feed"
-  configure_happ_subscription_feed
-  log_ok "Happ-compatible feed is active"
+  if is_enabled "${RECONFIGURE_HAPP_FEED}"; then
+    log_step "Configuring Happ-compatible subscription feed"
+    configure_happ_subscription_feed
+    log_ok "Happ-compatible feed is active"
+  else
+    log_step "Reusing existing Happ-compatible feed state"
+    load_existing_happ_feed_state
+    log_ok "Existing Happ-compatible feed state loaded"
+  fi
 fi
 
 SUMMARY_FILE="/root/nl-gateway-secrets-$(date +%Y%m%d-%H%M%S).txt"
