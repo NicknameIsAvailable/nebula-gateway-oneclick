@@ -605,6 +605,62 @@ detect_server_ip() {
   fi
 }
 
+build_naive_singbox_profile_json() {
+  jq -n \
+    --arg server "${NAIVE_DOMAIN}" \
+    --argjson server_port "${NAIVE_PORT}" \
+    --arg username "${NAIVE_USER}" \
+    --arg password "${NAIVE_PASS}" \
+    '{
+      log: {level: "warn"},
+      dns: {
+        servers: [
+          {
+            tag: "dns-remote",
+            address: "https://1.1.1.1/dns-query",
+            detour: "naive-out"
+          }
+        ],
+        final: "dns-remote"
+      },
+      inbounds: [
+        {
+          type: "tun",
+          tag: "tun-in",
+          inet4_address: "172.19.0.1/30",
+          auto_route: true,
+          strict_route: true,
+          stack: "system"
+        }
+      ],
+      outbounds: [
+        {
+          type: "naive",
+          tag: "naive-out",
+          server: $server,
+          server_port: $server_port,
+          username: $username,
+          password: $password,
+          tls: {
+            server_name: $server
+          }
+        },
+        {
+          type: "direct",
+          tag: "direct"
+        },
+        {
+          type: "block",
+          tag: "block"
+        }
+      ],
+      route: {
+        auto_detect_interface: true,
+        final: "naive-out"
+      }
+    }'
+}
+
 build_naive_caddy_if_needed() {
   if command -v /usr/local/bin/caddy-naive >/dev/null 2>&1; then
     if /usr/local/bin/caddy-naive list-modules 2>/dev/null | grep -q '^http.handlers.forward_proxy$'; then
@@ -932,6 +988,8 @@ MT_TLS_SECRET="ee${MTPROXY_SECRET}${DOMAIN_HEX}"
 
 VLESS_URI=""
 NAIVE_PROXY_URL="${NAIVE_PROXY_URL:-}"
+NAIVE_SINGBOX_JSON=""
+NAIVE_SINGBOX_JSON_FILE=""
 PRIMARY_URI=""
 PRIMARY_TYPE=""
 PRIMARY_TAG=""
@@ -944,6 +1002,9 @@ else
   PRIMARY_URI="${NAIVE_PROXY_URL}"
   PRIMARY_TYPE="naiveproxy"
   PRIMARY_TAG="nl-naiveproxy"
+  NAIVE_SINGBOX_JSON="$(build_naive_singbox_profile_json)"
+  NAIVE_SINGBOX_JSON_FILE="/root/naive-singbox-ios-$(date +%Y%m%d-%H%M%S).json"
+  printf '%s\n' "${NAIVE_SINGBOX_JSON}" >"${NAIVE_SINGBOX_JSON_FILE}"
 fi
 HY2_URI="hysteria2://${HY2_PASSWORD}@${SERVER_IP}:443/?insecure=1&sni=${HY2_SNI}#nl-hysteria2"
 MT_TLS_URL="https://t.me/proxy?server=${SERVER_IP}&port=7443&secret=${MT_TLS_SECRET}"
@@ -995,6 +1056,9 @@ Password: ${NAIVE_PASS}
 Upstream camouflage: ${NAIVE_UPSTREAM}
 Proxy URL:
 ${NAIVE_PROXY_URL}
+
+sing-box profile JSON file (Hiddify/iOS):
+${NAIVE_SINGBOX_JSON_FILE}
 EOF
 fi
 
@@ -1048,6 +1112,12 @@ if [[ "${SINGLE_TRANSPORT}" == "vless" ]]; then
 else
   echo "NaiveProxy URL:"
   echo "${NAIVE_PROXY_URL}"
+  echo
+  echo "NaiveProxy sing-box JSON (for Hiddify manual import):"
+  echo "${NAIVE_SINGBOX_JSON}"
+  echo
+  echo "NaiveProxy sing-box JSON saved to:"
+  echo "${NAIVE_SINGBOX_JSON_FILE}"
 fi
 echo
 echo "Hysteria2 URI:"
